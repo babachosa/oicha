@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/oicha-core", "crates/oicha-app"]
+resolver = "2"
+exclude = ["vendor/grid"]
+
+[patch.crates-io]
+grid = { path = "vendor/grid" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+

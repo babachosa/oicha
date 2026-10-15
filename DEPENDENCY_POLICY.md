@@ -1,0 +1,39 @@
+# Dependency policy
+
+The application and editor remain Rust/GPUI. The PowerShell scripts are build
+and QA tools; the desktop runtime does not execute them.
+
+CI queries OSV for every registry package/version in Cargo.lock. Incomplete
+responses, pagination that was not consumed, network failure after retries and
+unreviewed advisory IDs fail the check. Passing this check covers published
+advisories available from that service at scan time, not all possible defects.
+
+`grid 0.18.0` is a local security backport because GPUI 0.2.2/Taffy 0.9.0 use
+its 0.18 API. Registry grid 0.18.0 is affected by
+[GHSA-38c5-483c-4qqp](https://github.com/becheran/grid/security/advisories/GHSA-38c5-483c-4qqp).
+The local source adds checked dimension addition/multiplication before resizing,
+based on the [upstream fix](https://github.com/becheran/grid/commit/be213bd3528727148bef2d523c89e95d1fd9c072).
+Original license/source provenance is retained in vendor/grid. CI verifies the
+source hash and runs release tests for row/column overflows, both memory orders,
+unchanged state after overflow and valid growth. A version-only audit may still
+report 0.18.0; use the source backport and test evidence when assessing this case.
+
+The following explicitly tracked advisories are INFO Unmaintained, rather than
+published exploitable vulnerabilities. They belong to the pinned GPUI dependency
+graph (the lockfile also includes non-Windows targets). They are reported on
+every scan and temporarily allowed. Any new advisory ID blocks CI until review.
+They have not been represented as fixed or silently excluded from scan results.
+
+| Crate | Advisory | Follow-up |
+| --- | --- | --- |
+| async-std | [RUSTSEC-2025-0052](https://rustsec.org/advisories/RUSTSEC-2025-0052.html) | Track GPUI runtime migration |
+| instant | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384.html) | Track migration to web-time |
+| paste | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | Track upstream macro replacement |
+| proc-macro-error2 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | Track GPUI macro migration |
+| rustls-pemfile | [RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134.html) | Track upstream PEM parser migration |
+| rustybuzz | [RUSTSEC-2026-0206](https://rustsec.org/advisories/RUSTSEC-2026-0206.html) | Track upstream shaping migration |
+| ttf-parser | [RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192.html) | Track upstream font parser migration |
+
+Reassess these exceptions on every dependency upgrade. Renderer upgrades must
+pass the real native wrapping/IME/undo smoke tests; do not blindly replace the
+renderer or break its APIs to remove an informational warning.

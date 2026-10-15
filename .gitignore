@@ -1,0 +1,8 @@
+/target/
+*.oicha
+*.oicha.bak
+*.oicha.recovery
+*.oicha.lock
+/artifacts/
+/dist/
+

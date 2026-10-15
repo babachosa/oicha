@@ -1,0 +1,28 @@
+Oicha
+Copyright 2026 Oicha contributors
+
+This application uses GPUI 0.2.2, the GPU-accelerated Rust UI framework
+developed by Zed Industries, licensed under the Apache License 2.0.
+Source: https://github.com/zed-industries/zed
+
+This workspace vendors grid 0.18.0 by Armin Becher under the MIT license,
+with a dimension-overflow security backport. The original MIT license is
+retained in vendor/grid/LICENSE and in dist/licenses/grid-LICENSE-MIT.txt.
+Patch provenance: vendor/grid/OICHA_PATCH.md.
+
+Bundled Literata regular, italic, bold and bold italic:
+Copyright 2017 The Literata Project Authors (https://github.com/googlefonts/literata).
+Licensed under SIL Open Font License 1.1, included in
+dist/licenses/Literata-OFL.txt. Fonts are embedded unmodified from pinned commit
+0c2761b727a1b3a7cffd313c37f0f5163dfc7a63; provenance and hashes are recorded in
+crates/oicha-app/assets/fonts/literata/README.md.
+
+The complete dependency versions are recorded in Cargo.lock. Individual
+dependencies retain their respective copyrights and licenses. This local
+development package is not a signed or publicly published distribution.
+
+The Windows installer uses NSIS 3.13, Copyright 1999-2026 Contributors;
+its applicable licenses are included as licenses/NSIS-COPYING.txt in the installed package.
+App-local Microsoft Visual C++ redistributable DLLs retain Microsoft's copyright
+and license terms; see licenses/Microsoft-VC-Runtime-NOTICE.txt and the installed
+package-manifest.json for their versions and hashes. They are not Apache-licensed.
