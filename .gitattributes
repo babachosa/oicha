@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.png -text
+*.ico -text
+*.bmp -text
+*.ttf -text
+# Security provenance records the exact upstream/backport source bytes.
+vendor/grid/src/lib.rs -text

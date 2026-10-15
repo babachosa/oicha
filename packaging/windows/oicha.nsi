@@ -230,6 +230,11 @@ empty:
   ReadRegDWORD $OldDesktop HKCU "${APP_KEY}" "Desktop"
   ReadRegDWORD $OldMenu HKCU "${APP_KEY}" "StartMenu"
   ReadRegDWORD $OldAssociation HKCU "${APP_KEY}" "Association"
+  ReadRegStr $0 HKCU "${APP_KEY}" "Version"
+  ${If} $0 != ""
+  ${AndIf} $OldMenu != 1
+    SectionSetFlags ${StartMenu} 0
+  ${EndIf}
   ${If} $OldDesktop = 1
     SectionSetFlags ${Desktop} 1
   ${EndIf}

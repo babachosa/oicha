@@ -1,3 +1,4 @@
+use crate::settings::{Language, Preferences, ui_format};
 use crate::text_editor::{EditorEvent, TextEditor};
 use gpui::{prelude::*, *};
 use oicha_core::{
@@ -49,6 +50,7 @@ struct Confirmation {
 }
 enum Pending {
     Close,
+    Update,
     New,
     Open(PathBuf),
     Loaded(Box<LoadedBook>),
@@ -61,6 +63,12 @@ struct LoadedBook {
 }
 
 pub struct Oicha {
+    language: Language,
+    settings: bool,
+    update_status: UpdateStatus,
+    update_available: Option<oicha_update::Available>,
+    update_ready: Option<oicha_update::Prepared>,
+    update_progress: Arc<std::sync::atomic::AtomicU64>,
     book: Manuscript,
     editors: Vec<Entity<TextEditor>>,
     active: usize,
@@ -94,6 +102,16 @@ pub struct Oicha {
     _autosave: Task<()>,
 }
 
+enum UpdateStatus {
+    Idle,
+    Checking,
+    Current,
+    Available,
+    Downloading,
+    Ready,
+    Failed(String),
+}
+
 fn data_dir() -> PathBuf {
     directories::ProjectDirs::from("dev", "Oicha", "Oicha")
         .map(|p| p.data_local_dir().to_owned())
@@ -122,6 +140,14 @@ impl Oicha {
     /// Isolated visual QA, available only under the explicit smoke-test flag.
     pub fn preview_popup(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
+            "settings" | "settings-en" => {
+                if kind == "settings-en" {
+                    self.set_language(Language::En, window, cx);
+                }
+                self.begin_modal();
+                self.settings = true;
+                self.modal_focus.focus(window);
+            }
             "prose" => {
                 self.editors[self.active].update(cx, |e, cx| {
                     let mut body = RichText::plain("chúng ta không thuộc về nhau, chúng ta không thuộc về nơi này niềm tin. Những niềm vui vẫn ở lại, cùng những câu chuyện chưa kể.\n\n".repeat(10));
@@ -207,6 +233,22 @@ impl Oicha {
             let mut close_gate = None;
             let result: anyhow::Result<()> = async {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
+                this.update_in(cx, |this, window, cx| {
+                    let original = this.book.clone();
+                    let language = this.language;
+                    this.set_language(Language::En, window, cx);
+                    assert_eq!(Preferences::load().language, Language::En);
+                    assert_eq!(this.editors[this.active].read(cx).language, Language::En);
+                    this.show_prompt(PromptKind::Search, window, cx);
+                    assert_eq!(this.prompt.as_ref().unwrap().title, "Find in chapter");
+                    assert_eq!(this.prompt.as_ref().unwrap().input.read(cx).language, Language::En);
+                    this.begin_modal();
+                    this.set_language(Language::Vi, window, cx);
+                    assert_eq!(Preferences::load().language, Language::Vi);
+                    this.set_language(language, window, cx);
+                    assert_eq!(serde_json::to_vec(&this.book).unwrap(), serde_json::to_vec(&original).unwrap(), "Changing interface language changed the manuscript");
+                    this.editors[this.active].read(cx).focus.focus(window);
+                })?;
                 cx.update(|window, _| crate::fonts::validate_vietnamese(window))??;
                 cx.update(|window, _| TextEditor::validate_prose_wrap(window))??;
                 let editor = this.update(cx, |this, _| this.editors[this.active].clone())?;
@@ -710,6 +752,7 @@ impl Oicha {
         }).detach();
     }
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let language = crate::settings::Preferences::load().language;
         let remembered = std::fs::read_to_string(data_dir().join("last-session"))
             .ok()
             .map(PathBuf::from);
@@ -734,8 +777,10 @@ impl Oicha {
                 None,
                 None,
                 false,
-                Some(format!(
-                    "Không mở được bản thảo: {e:#}. File gốc được giữ nguyên. Hãy Mở file khác hoặc Lưu thành bản mới."
+                Some(ui_format!(
+                    language,
+                    "Không mở được bản thảo: {e:#}. File gốc được giữ nguyên. Hãy Mở file khác hoặc Lưu thành bản mới.",
+                    "Cannot open manuscript: {e:#}. The original file is preserved. Open another file or use Save as."
                 )),
             ),
         };
@@ -768,6 +813,12 @@ impl Oicha {
             }
         });
         let mut this = Self {
+            language,
+            settings: false,
+            update_status: UpdateStatus::Idle,
+            update_available: None,
+            update_ready: None,
+            update_progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             book,
             editors: vec![],
             active: 0,
@@ -778,9 +829,9 @@ impl Oicha {
             io_busy: false,
             pending: None,
             status: if recovered {
-                "Đã phục hồi bản thảo sau lần thoát trước"
+                language.text("Đã phục hồi bản thảo sau lần thoát trước")
             } else {
-                "Đã lưu trên máy"
+                language.text("Đã lưu trên máy")
             }
             .into(),
             error,
@@ -806,6 +857,33 @@ impl Oicha {
             _autosave: timer,
         };
         this.build_editors(window, cx);
+        if !std::env::args_os()
+            .nth(1)
+            .is_some_and(|s| s == "--smoke-test")
+        {
+            if let Ok(result) =
+                std::fs::read_to_string(crate::settings::data_dir().join("update-result.txt"))
+            {
+                this.notice = Some(if result == "OK" {
+                    language
+                        .choose(
+                            "Đã cập nhật Oicha thành công.",
+                            "Oicha was updated successfully.",
+                        )
+                        .into()
+                } else {
+                    format!(
+                        "{} {result}",
+                        language.choose(
+                            "Không thể hoàn tất cập nhật.",
+                            "The update could not finish."
+                        )
+                    )
+                });
+                let _ = std::fs::remove_file(crate::settings::data_dir().join("update-result.txt"));
+            }
+            this.check_updates(window, cx);
+        }
         this
     }
 
@@ -817,6 +895,7 @@ impl Oicha {
             let body = chapter.body.clone();
             let entity = cx.new(|cx| {
                 let mut e = TextEditor::new(body, false, window, cx);
+                e.language = self.language;
                 e.font_size = self.font_size;
                 e.family = self.family.clone();
                 e.spacing = self.spacing;
@@ -836,7 +915,7 @@ impl Oicha {
                             {
                                 chapter.body = editor.read(cx).engine.body.clone();
                                 this.book.revision += 1;
-                                this.status = "Có thay đổi chưa lưu".into();
+                                this.status = this.language.text("Có thay đổi chưa lưu").into();
                             }
                         }
                         EditorEvent::Command => this.show_prompt(PromptKind::Command, window, cx),
@@ -854,8 +933,9 @@ impl Oicha {
     }
 
     fn dirty(&mut self, cx: &mut Context<Self>) {
+        let language = self.language;
         self.book.revision += 1;
-        self.status = "Có thay đổi chưa lưu".into();
+        self.status = language.text("Có thay đổi chưa lưu").into();
         cx.notify();
     }
     fn activate_chapter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -890,6 +970,7 @@ impl Oicha {
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         if self.saving || self.io_busy {
             return;
         }
@@ -898,7 +979,7 @@ impl Oicha {
             return;
         };
         self.saving = true;
-        self.status = "Đang lưu…".into();
+        self.status = language.text("Đang lưu…").into();
         let snapshot = self.book.clone();
         let revision = snapshot.revision;
         cx.spawn_in(window, async move |this, cx| {
@@ -913,6 +994,7 @@ impl Oicha {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                let language = this.language;
                 this.saving = false;
                 match result {
                     Ok(()) => {
@@ -920,16 +1002,22 @@ impl Oicha {
                         this.error = None;
                         this.recovered = false;
                         this.status = if this.book.revision == revision {
-                            "Đã lưu trên máy"
+                            language.text("Đã lưu trên máy")
                         } else {
-                            "Có thay đổi chưa lưu"
+                            language.text("Có thay đổi chưa lưu")
                         }
                         .into();
                         this.drive_pending(window, cx);
                     }
                     Err(e) => {
-                        this.error = Some(format!("Không lưu được: {e:#}"));
-                        this.status = "Lưu thất bại · hãy Lưu thành file khác".into();
+                        this.error = Some(ui_format!(
+                            language,
+                            "Không lưu được: {e:#}",
+                            "Could not save: {e:#}"
+                        ));
+                        this.status = language
+                            .text("Lưu thất bại · hãy Lưu thành file khác")
+                            .into();
                     }
                 }
                 cx.notify();
@@ -940,6 +1028,7 @@ impl Oicha {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         if self.saving || self.io_busy {
             return;
         }
@@ -950,7 +1039,10 @@ impl Oicha {
             .and_then(|p| p.parent())
             .unwrap_or(Path::new("."))
             .to_owned();
-        let receiver = cx.prompt_for_new_path(&directory, Some("Tieu-thuyet.oicha"));
+        let receiver = cx.prompt_for_new_path(
+            &directory,
+            Some(language.choose("Tieu-thuyet.oicha", "Novel.oicha")),
+        );
         cx.spawn_in(window, async move |this, cx| {
             let path = match receiver.await {
                 Ok(Ok(Some(p))) => p,
@@ -983,6 +1075,7 @@ impl Oicha {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                let language = this.language;
                 this.io_busy = false;
                 match result {
                     Ok(store) => {
@@ -990,10 +1083,16 @@ impl Oicha {
                         this.store = Some(Arc::new(Mutex::new(store)));
                         this.saved_revision = revision;
                         this.error = None;
-                        this.status = "Đã lưu bản thảo mới".into();
+                        this.status = language.text("Đã lưu bản thảo mới").into();
                         this.drive_pending(window, cx);
                     }
-                    Err(e) => this.error = Some(format!("Không lưu được bản mới: {e:#}")),
+                    Err(e) => {
+                        this.error = Some(ui_format!(
+                            language,
+                            "Không lưu được bản mới: {e:#}",
+                            "Could not save the new copy: {e:#}"
+                        ))
+                    }
                 }
                 cx.notify();
             });
@@ -1002,11 +1101,30 @@ impl Oicha {
     }
 
     fn finish_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         match self.pending.take() {
             Some(Pending::Close) => window.remove_window(),
+            Some(Pending::Update) => {
+                if let Some(update) = self.update_ready.take() {
+                    match update.launch(
+                        self.path.clone(),
+                        crate::settings::data_dir().join("update-result.txt"),
+                    ) {
+                        Ok(()) => window.remove_window(),
+                        Err(error) => {
+                            self.update_status = UpdateStatus::Failed(format!("{error:#}"));
+                            cx.notify();
+                        }
+                    }
+                }
+            }
             Some(Pending::New) => {
                 let result = scratch().and_then(|(mut s, _)| {
-                    let book = Manuscript::new();
+                    let mut book = Manuscript::new();
+                    if language == Language::En {
+                        book.title = "Untitled novel".into();
+                        book.chapters[0].title = "Chapter 1".into();
+                    }
                     s.save(&book)?;
                     Ok((s, book))
                 });
@@ -1023,7 +1141,13 @@ impl Oicha {
                         self.notice = None;
                         self.build_editors(window, cx);
                     }
-                    Err(e) => self.error = Some(format!("Không tạo được bản thảo: {e:#}")),
+                    Err(e) => {
+                        self.error = Some(ui_format!(
+                            language,
+                            "Không tạo được bản thảo: {e:#}",
+                            "Could not create manuscript: {e:#}"
+                        ))
+                    }
                 }
             }
             Some(Pending::Open(path)) => self.load(path, window, cx),
@@ -1041,6 +1165,7 @@ impl Oicha {
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         if self.io_busy || self.saving {
             return;
         }
@@ -1049,13 +1174,17 @@ impl Oicha {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Mở bản thảo .oicha, .txt hoặc .recovery".into()),
+            prompt: Some(
+                language
+                    .text("Mở bản thảo .oicha, .txt hoặc .recovery")
+                    .into(),
+            ),
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = receiver.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.io_busy = false;
-                if matches!(this.pending, Some(Pending::Close)) {
+                if matches!(this.pending, Some(Pending::Close | Pending::Update)) {
                     this.drive_pending(window, cx);
                     cx.notify();
                     return;
@@ -1088,6 +1217,7 @@ impl Oicha {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let language = self.language;
         self.io_busy = true;
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -1104,6 +1234,9 @@ impl Oicha {
                                 "Text file exceeds 64 MiB"
                             );
                             let mut book = Manuscript::new();
+                            if language == Language::En {
+                                book.chapters[0].title = "Chapter 1".into();
+                            }
                             book.title = path
                                 .file_stem()
                                 .unwrap_or_default()
@@ -1129,10 +1262,11 @@ impl Oicha {
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                let language = this.language;
                 this.io_busy = false;
                 match result {
                     Ok((store, book, recovered)) => {
-                        if !matches!(this.pending, Some(Pending::Close)) {
+                        if !matches!(this.pending, Some(Pending::Close | Pending::Update)) {
                             this.pending = Some(Pending::Loaded(Box::new(LoadedBook {
                                 store,
                                 book,
@@ -1142,7 +1276,11 @@ impl Oicha {
                         this.drive_pending(window, cx);
                     }
                     Err(e) => {
-                        this.error = Some(format!("Không mở được: {e:#}"));
+                        this.error = Some(ui_format!(
+                            language,
+                            "Không mở được: {e:#}",
+                            "Could not open: {e:#}"
+                        ));
                         this.drive_pending(window, cx);
                     }
                 }
@@ -1153,6 +1291,7 @@ impl Oicha {
     }
 
     fn install_loaded(&mut self, loaded: LoadedBook, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         let LoadedBook {
             store,
             book,
@@ -1175,9 +1314,9 @@ impl Oicha {
         self.prompt = None;
         self.query.clear();
         self.status = if recovered {
-            "Đã phục hồi bản thảo"
+            language.text("Đã phục hồi bản thảo")
         } else {
-            "Đã mở bản thảo"
+            language.text("Đã mở bản thảo")
         }
         .into();
         self.build_editors(window, cx);
@@ -1185,6 +1324,7 @@ impl Oicha {
     }
 
     fn export(&mut self, text: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         let snapshot = self.book.clone();
         let directory = self
             .path
@@ -1196,9 +1336,9 @@ impl Oicha {
         let receiver = cx.prompt_for_new_path(
             &directory,
             Some(if text {
-                "Tieu-thuyet.txt"
+                language.choose("Tieu-thuyet.txt", "Novel.txt")
             } else {
-                "Tieu-thuyet.docx"
+                language.choose("Tieu-thuyet.docx", "Novel.docx")
             }),
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -1207,14 +1347,15 @@ impl Oicha {
             };
             let converted = path.with_extension(extension);
             let _ = this.update_in(cx, |this, window, cx| {
+                let language = this.language;
                 // The native picker already confirms an unchanged path. A
                 // changed extension can point at a different existing file.
                 if converted != path && converted.exists() {
                     this.begin_modal();
                     this.confirmation = Some(Confirmation {
-                        title: "Thay thế file đã có?".into(),
+                        title: language.text("Thay thế file đã có?").into(),
                         description: converted.display().to_string(),
-                        label: "Ghi đè file",
+                        label: language.text("Ghi đè file"),
                         action: Some(ConfirmAction::Export {
                             book: Box::new(snapshot),
                             path: converted,
@@ -1252,9 +1393,19 @@ impl Oicha {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let language = this.language;
                 match result {
-                    Ok(()) => this.status = format!("Đã xuất: {display}"),
-                    Err(e) => this.error = Some(format!("Xuất file thất bại: {e:#}")),
+                    Ok(()) => {
+                        this.status =
+                            ui_format!(language, "Đã xuất: {display}", "Exported: {display}")
+                    }
+                    Err(e) => {
+                        this.error = Some(ui_format!(
+                            language,
+                            "Xuất file thất bại: {e:#}",
+                            "Export failed: {e:#}"
+                        ))
+                    }
                 }
                 cx.notify();
             });
@@ -1272,6 +1423,7 @@ impl Oicha {
         self.prompt = None;
         self.help = false;
         self.confirmation = None;
+        self.settings = false;
     }
 
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1295,6 +1447,7 @@ impl Oicha {
                 this.prompt = None;
                 this.help = false;
                 this.confirmation = None;
+                this.settings = false;
                 this.modal_closing = false;
                 this.editors[this.active].read(cx).focus.focus(window);
                 cx.notify();
@@ -1317,12 +1470,13 @@ impl Oicha {
     }
 
     fn show_prompt(&mut self, kind: PromptKind, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         self.begin_modal();
         let (title, value) = match &kind {
-            PromptKind::BookTitle => ("Tên tiểu thuyết", self.book.title.clone()),
-            PromptKind::Author => ("Tên tác giả", self.book.author.clone()),
+            PromptKind::BookTitle => (language.text("Tên tiểu thuyết"), self.book.title.clone()),
+            PromptKind::Author => (language.text("Tên tác giả"), self.book.author.clone()),
             PromptKind::Chapter(id) => (
-                "Đổi tên chương",
+                language.text("Đổi tên chương"),
                 self.book
                     .chapters
                     .iter()
@@ -1331,7 +1485,7 @@ impl Oicha {
                     .unwrap_or_default(),
             ),
             PromptKind::Synopsis(id) => (
-                "Ghi chú & tóm tắt chương",
+                language.text("Ghi chú & tóm tắt chương"),
                 self.book
                     .chapters
                     .iter()
@@ -1340,15 +1494,16 @@ impl Oicha {
                     .unwrap_or_default(),
             ),
             PromptKind::Goal => (
-                "Mục tiêu từ mỗi phiên viết",
+                language.text("Mục tiêu từ mỗi phiên viết"),
                 self.book.daily_goal.to_string(),
             ),
-            PromptKind::Search => ("Tìm trong chương", self.query.clone()),
-            PromptKind::Command => ("Lệnh Vim", String::new()),
+            PromptKind::Search => (language.text("Tìm trong chương"), self.query.clone()),
+            PromptKind::Command => (language.text("Lệnh Vim"), String::new()),
         };
         self.editors[self.active].update(cx, |e, _| e.engine.finish_group());
         let input = cx.new(|cx| {
             let mut e = TextEditor::new(RichText::plain(value), true, window, cx);
+            e.language = language;
             e.engine.select_all();
             e.multiline = matches!(kind, PromptKind::Synopsis(_));
             e
@@ -1373,6 +1528,7 @@ impl Oicha {
         self.close_modal(window, cx);
     }
     fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         if self.modal_closing {
             return;
         }
@@ -1412,7 +1568,13 @@ impl Oicha {
                     self.book.daily_goal = goal;
                     self.dirty(cx);
                 }
-                _ => self.error = Some("Mục tiêu phải là số từ 1 đến 100.000.".into()),
+                _ => {
+                    self.error = Some(
+                        language
+                            .text("Mục tiêu phải là số từ 1 đến 100.000.")
+                            .into(),
+                    )
+                }
             },
             PromptKind::Search => {
                 self.query = value;
@@ -1426,6 +1588,7 @@ impl Oicha {
         cx.notify();
     }
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         match command {
             "w" => self.save(window, cx),
             "wa" | "saveas" => self.save_as(window, cx),
@@ -1434,7 +1597,11 @@ impl Oicha {
                 if self.book.revision == self.saved_revision {
                     self.request_close(window, cx);
                 } else {
-                    self.error = Some("Bản thảo chưa lưu. Dùng :wq để lưu và đóng.".into());
+                    self.error = Some(
+                        language
+                            .text("Bản thảo chưa lưu. Dùng :wq để lưu và đóng.")
+                            .into(),
+                    );
                 }
             }
             "new" => self.new_book(window, cx),
@@ -1460,14 +1627,17 @@ impl Oicha {
                         e.reveal_cursor(cx);
                     });
                 } else {
-                    self.error = Some(format!(
-                        "Chưa hỗ trợ lệnh :{command}. Nhấn F1 để xem các lệnh có sẵn."
+                    self.error = Some(ui_format!(
+                        language,
+                        "Chưa hỗ trợ lệnh :{command}. Nhấn F1 để xem các lệnh có sẵn.",
+                        "Command :{command} is not supported. Press F1 to see available commands."
                     ));
                 }
             }
         }
     }
     fn find_next(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let language = self.language;
         let query = self.query.clone();
         let found = self.editors[self.active].update(cx, |e, cx| {
             let found = e.engine.find(&query, backwards);
@@ -1475,9 +1645,17 @@ impl Oicha {
             found
         });
         self.status = if found {
-            format!("Tìm thấy “{query}” · n / N để di chuyển")
+            ui_format!(
+                language,
+                "Tìm thấy “{query}” · n / N để di chuyển",
+                "Found “{query}” · n / N to navigate"
+            )
         } else {
-            format!("Không tìm thấy “{query}” trong chương")
+            ui_format!(
+                language,
+                "Không tìm thấy “{query}” trong chương",
+                "“{query}” was not found in this chapter"
+            )
         };
     }
     fn toggle_vim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1492,12 +1670,17 @@ impl Oicha {
         cx.notify();
     }
     fn add_chapter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         self.active = self.book.add_chapter();
+        if language == Language::En {
+            self.book.chapters[self.active].title = format!("Chapter {}", self.active + 1);
+        }
         // Existing editor entities keep their undo histories when chapters are added.
         let chapter = &self.book.chapters[self.active];
         let id = chapter.id;
         let entity = cx.new(|cx| {
             let mut e = TextEditor::new(chapter.body.clone(), false, window, cx);
+            e.language = language;
             e.font_size = self.font_size;
             e.family = self.family.clone();
             e.spacing = self.spacing;
@@ -1527,7 +1710,7 @@ impl Oicha {
         ));
         entity.read(cx).focus.focus(window);
         self.editors.push(entity);
-        self.status = "Đã thêm chương".into();
+        self.status = language.text("Đã thêm chương").into();
         cx.notify();
     }
     fn reorder(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1541,21 +1724,24 @@ impl Oicha {
         self.dirty(cx);
     }
     fn delete_chapter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
         if self.book.chapters.len() == 1 {
-            self.error = Some("Bản thảo cần ít nhất một chương.".into());
+            self.error = Some(language.text("Bản thảo cần ít nhất một chương.").into());
             return;
         }
         let chapter = &self.book.chapters[self.active];
         let id = chapter.id;
-        let description = format!(
+        let description = ui_format!(
+            language,
             "“{}” sẽ bị xóa khỏi bản thảo. File .bak giữ phiên bản lưu trước đó.",
+            "“{}” will be deleted from the manuscript. The .bak file keeps the previous saved version.",
             chapter.title
         );
         self.begin_modal();
         self.confirmation = Some(Confirmation {
-            title: "Xóa chương này?".into(),
+            title: language.text("Xóa chương này?").into(),
             description,
-            label: "Xóa chương",
+            label: language.text("Xóa chương"),
             action: Some(ConfirmAction::DeleteChapter(id)),
         });
         self.modal_focus.focus(window);
@@ -1589,7 +1775,7 @@ impl Oicha {
     fn keyboard(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let ctrl = k.modifiers.control || k.modifiers.platform;
-        if self.modal_closing || self.help || self.confirmation.is_some() {
+        if self.modal_closing || self.help || self.settings || self.confirmation.is_some() {
             if !self.modal_closing {
                 match k.key.as_str() {
                     "escape" => self.close_modal(window, cx),
@@ -1802,6 +1988,25 @@ impl Oicha {
                     }),
             )
             .child(
+                Self::button(
+                    "settings",
+                    if self.update_available.is_some() {
+                        self.language
+                            .choose("Cài đặt · Có cập nhật", "Settings · Update available")
+                    } else {
+                        self.language.choose("Cài đặt", "Settings")
+                    },
+                )
+                .mr(px(12.))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.begin_modal();
+                    this.settings = true;
+                    this.editors[this.active].update(cx, |e, _| e.engine.finish_group());
+                    this.modal_focus.focus(window);
+                    cx.notify();
+                })),
+            )
+            .child(
                 Self::caption_button("window-minimize", WindowControlArea::Min, false).when(
                     !cfg!(target_os = "windows"),
                     |button| {
@@ -1835,7 +2040,425 @@ impl Oicha {
             )
     }
 
+    /// Explicit QA entry point: uses a real signed installer, isolated document,
+    /// and the production helper/save/installation path. No feed overrides exist
+    /// in normal app sessions.
+    pub fn start_update_smoke(
+        &mut self,
+        envelope: PathBuf,
+        installer: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let update =
+                    oicha_update::available(&std::fs::read(envelope)?, env!("CARGO_PKG_VERSION"))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("QA target must be newer than the installed baseline")
+                        })?;
+                let ready = cx
+                    .background_executor()
+                    .spawn(async move {
+                        oicha_update::stage(
+                            update,
+                            &crate::settings::data_dir().join("updates"),
+                            std::fs::File::open(installer)?,
+                            |_, _| {},
+                        )
+                    })
+                    .await?;
+                let (path, original) = this.update_in(cx, |this, window, cx| {
+                    this.set_language(Language::En, window, cx);
+                    this.update_available = Some(ready.available.clone());
+                    this.update_ready = Some(ready);
+                    this.update_status = UpdateStatus::Ready;
+                    let path = this.path.clone().unwrap();
+                    let original = std::fs::read(&path).unwrap();
+                    this.editors[this.active].update(cx, |e, cx| {
+                        e.engine.move_to(e.engine.body.text.len(), false);
+                        e.engine
+                            .insert("\nUPDATE_PRESERVE: Tiếng Việt 🌿 — unsaved text");
+                        cx.emit(EditorEvent::Changed);
+                    });
+                    (path, original)
+                })?;
+                // A concurrent external edit must block the updater at the save
+                // gate. Restore the fixture, then retry the exact same update.
+                atomic_write(&path, b"external edit must block update")?;
+                this.update_in(cx, |this, window, cx| this.install_update(window, cx))?;
+                for _ in 0..100 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if this.update(cx, |this, _| !this.saving)? {
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    this.update(cx, |this, _| this.error.is_some()
+                        && this.update_ready.is_some()
+                        && matches!(this.pending, Some(Pending::Update)))?,
+                    "Save failure did not block installation"
+                );
+                atomic_write(
+                    &path.with_extension("update-save-gate.txt"),
+                    b"PASS: failed save kept window and pending update open",
+                )?;
+                atomic_write(&path, &original)?;
+                let loading = path.with_extension("update-target.oicha");
+                let mut target_store = Store::create(loading.clone())?;
+                target_store.save(&Manuscript::new())?;
+                drop(target_store);
+                this.update_in(cx, |this, window, cx| {
+                    this.error = None;
+                    this.load(loading, window, cx);
+                    this.install_update(window, cx);
+                })?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(path) = &this.path {
+                        let _ = atomic_write(
+                            &path.with_extension("update-failure.txt"),
+                            format!("{error:#}").as_bytes(),
+                        );
+                    }
+                    this.error = Some(format!("Update QA: {error:#}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_language(&mut self, language: Language, window: &mut Window, cx: &mut Context<Self>) {
+        if self.language == language {
+            return;
+        }
+        if let Err(error) = (Preferences { language }).save() {
+            self.error = Some(format!(
+                "{} {error:#}",
+                self.language
+                    .choose("Không lưu được cài đặt:", "Could not save settings:")
+            ));
+            cx.notify();
+            return;
+        }
+        self.language = language;
+        self.status = language
+            .text(if self.saving {
+                "Đang lưu…"
+            } else if self.book.revision != self.saved_revision {
+                "Có thay đổi chưa lưu"
+            } else {
+                "Đã lưu trên máy"
+            })
+            .into();
+        for editor in &self.editors {
+            editor.update(cx, |e, cx| {
+                e.language = language;
+                cx.notify();
+            });
+        }
+        window.set_window_title(language.choose(
+            "Oicha · Không gian viết tiểu thuyết",
+            "Oicha · A space for your novel",
+        ));
+        cx.notify();
+    }
+
+    fn check_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading | UpdateStatus::Ready
+        ) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { oicha_update::check(env!("CARGO_PKG_VERSION")) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(update)) => {
+                        this.update_available = Some(update);
+                        this.update_status = UpdateStatus::Available;
+                    }
+                    Ok(None) => {
+                        this.update_available = None;
+                        this.update_status = UpdateStatus::Current;
+                    }
+                    Err(error) => this.update_status = UpdateStatus::Failed(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn download_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Downloading | UpdateStatus::Ready
+        ) {
+            return;
+        }
+        let Some(available) = self.update_available.clone() else {
+            return;
+        };
+        self.update_status = UpdateStatus::Downloading;
+        self.update_progress
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let progress = self.update_progress.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    oicha_update::download(
+                        available,
+                        &crate::settings::data_dir().join("updates"),
+                        |done, total| {
+                            progress.store(
+                                done.saturating_mul(100) / total.max(1),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        },
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(update) => {
+                        this.update_ready = Some(update);
+                        this.update_status = UpdateStatus::Ready;
+                    }
+                    Err(error) => this.update_status = UpdateStatus::Failed(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let downloading = this.update(cx, |this, cx| {
+                    if this.settings {
+                        cx.notify();
+                    }
+                    matches!(this.update_status, UpdateStatus::Downloading)
+                });
+                if !matches!(downloading, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn install_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_ready.is_none() {
+            return;
+        }
+        if let Err(error) = oicha_update::managed_installation().and_then(|target| {
+            anyhow::ensure!(
+                std::env::current_exe()?.canonicalize()?
+                    == target.join("Oicha.exe").canonicalize()?,
+                "Use the installed Oicha app to update"
+            );
+            Ok(())
+        }) {
+            self.update_status = UpdateStatus::Failed(format!("{error:#}"));
+            cx.notify();
+            return;
+        }
+        self.pending = Some(Pending::Update);
+        self.drive_pending(window, cx);
+    }
+
+    fn settings_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let l = self.language;
+        let version = self
+            .update_available
+            .as_ref()
+            .map(|u| u.manifest.version.as_str())
+            .unwrap_or("");
+        let message = match &self.update_status {
+            UpdateStatus::Idle => l
+                .choose(
+                    "Kiểm tra phiên bản mới trên GitHub Releases.",
+                    "Check GitHub Releases for a new version.",
+                )
+                .into(),
+            UpdateStatus::Checking => l
+                .choose("Đang kiểm tra cập nhật…", "Checking for updates…")
+                .into(),
+            UpdateStatus::Current => l
+                .choose(
+                    "Bạn đang dùng phiên bản mới nhất đã phát hành.",
+                    "You have the latest published version.",
+                )
+                .into(),
+            UpdateStatus::Available => format!(
+                "{} {version}",
+                l.choose("Có phiên bản mới:", "New version available:")
+            ),
+            UpdateStatus::Downloading => format!(
+                "{} {}%",
+                l.choose("Đang tải…", "Downloading…"),
+                self.update_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            UpdateStatus::Ready => l
+                .choose(
+                    "Đã xác minh gói cập nhật. Bản thảo sẽ được lưu trước khi khởi động lại.",
+                    "Update verified. Your manuscript will be saved before restarting.",
+                )
+                .into(),
+            UpdateStatus::Failed(error) => format!(
+                "{}\n{error}",
+                l.choose(
+                    "Không thể cập nhật. Bạn có thể thử lại.",
+                    "Could not update. You can try again."
+                )
+            ),
+        };
+        let busy = matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading
+        );
+        let card = div()
+            .w(px(570.))
+            .p(px(30.))
+            .flex()
+            .flex_col()
+            .gap(px(20.))
+            .child(Self::modal_heading(
+                l.choose("Cài đặt", "Settings").into(),
+                l.choose(
+                    "Tùy chỉnh không gian viết của bạn.",
+                    "Make your writing space your own.",
+                ),
+                "OICHA",
+            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(l.choose("Ngôn ngữ giao diện", "Interface language")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(
+                        Self::modal_button("language-vi", "Tiếng Việt", l == Language::Vi, false)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_language(Language::Vi, window, cx)
+                            })),
+                    )
+                    .child(
+                        Self::modal_button("language-en", "English", l == Language::En, false)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_language(Language::En, window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(l.choose(
+                        "Áp dụng ngay. Nội dung bản thảo giữ nguyên.",
+                        "Applies immediately. Your manuscript content stays as written.",
+                    )),
+            )
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .pt(px(18.))
+                    .text_size(px(14.))
+                    .child(format!("Oicha {}", env!("CARGO_PKG_VERSION"))),
+            )
+            .child(div().text_size(px(12.)).line_height(px(20.)).child(message))
+            .when(self.update_available.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("release-notes")
+                        .max_h(px(100.))
+                        .overflow_y_scroll()
+                        .text_size(px(12.))
+                        .line_height(px(20.))
+                        .text_color(rgb(MUTED))
+                        .child(
+                            self.update_available
+                                .as_ref()
+                                .unwrap()
+                                .manifest
+                                .notes
+                                .clone(),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        Self::modal_button("close-settings", l.text("Đóng"), false, false)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_modal(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Self::modal_button(
+                            "update-action",
+                            if self.update_ready.is_some() {
+                                l.choose("Khởi động lại để cập nhật", "Restart to update")
+                            } else if self.update_available.is_some() {
+                                l.choose("Tải cập nhật", "Download update")
+                            } else {
+                                l.choose("Kiểm tra cập nhật", "Check for updates")
+                            },
+                            true,
+                            false,
+                        )
+                        .when(busy, |d| d.opacity(0.5))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if matches!(
+                                this.update_status,
+                                UpdateStatus::Checking | UpdateStatus::Downloading
+                            ) {
+                                return;
+                            }
+                            if this.update_ready.is_some() {
+                                this.install_update(window, cx);
+                            } else if this.update_available.is_some() {
+                                this.download_update(window, cx);
+                            } else {
+                                this.check_updates(window, cx);
+                            }
+                        })),
+                    ),
+            );
+        self.modal_shell(card, cx)
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let session_words = self.book.words().saturating_sub(self.session_start_words);
         let goal = self.book.daily_goal.max(1);
         div()
@@ -1863,7 +2486,7 @@ impl Oicha {
                             .mt(px(3.))
                             .text_size(px(10.))
                             .text_color(rgb(MUTED))
-                            .child("MỖI CÂU CHỮ, MỘT THẾ GIỚI"),
+                            .child(language.text("MỖI CÂU CHỮ, MỘT THẾ GIỚI")),
                     ),
             )
             .child(
@@ -1877,7 +2500,7 @@ impl Oicha {
                             .text_size(px(10.))
                             .text_color(rgb(MUTED))
                             .mb(px(8.))
-                            .child("BẢN THẢO"),
+                            .child(language.text("BẢN THẢO")),
                     )
                     .child(
                         div()
@@ -1899,7 +2522,7 @@ impl Oicha {
                             .text_color(rgb(MUTED))
                             .cursor_pointer()
                             .child(if self.book.author.is_empty() {
-                                "Thêm tên tác giả".into()
+                                language.text("Thêm tên tác giả").into()
                             } else {
                                 self.book.author.clone()
                             })
@@ -1912,8 +2535,10 @@ impl Oicha {
                             .mt(px(10.))
                             .text_size(px(11.))
                             .text_color(rgb(MUTED))
-                            .child(format!(
+                            .child(ui_format!(
+                                language,
                                 "{} chương  ·  {} từ",
+                                "{} chapters  ·  {} words",
                                 self.book.chapters.len(),
                                 self.book.words()
                             )),
@@ -1931,7 +2556,7 @@ impl Oicha {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(MUTED))
-                            .child("MỤC LỤC"),
+                            .child(language.text("MỤC LỤC")),
                     )
                     .child(
                         Self::button("add-chapter", "+").on_click(
@@ -1986,7 +2611,12 @@ impl Oicha {
                                                     .mt(px(4.))
                                                     .text_size(px(10.))
                                                     .text_color(rgb(MUTED))
-                                                    .child(format!("{} từ", c.body.words())),
+                                                    .child(ui_format!(
+                                                        language,
+                                                        "{} từ",
+                                                        "{} words",
+                                                        c.body.words()
+                                                    )),
                                             ),
                                     ),
                             )
@@ -2006,8 +2636,14 @@ impl Oicha {
                             .justify_between()
                             .text_size(px(11.))
                             .text_color(rgb(MUTED))
-                            .child("PHIÊN VIẾT NÀY")
-                            .child(format!("{} / {} từ", session_words, goal)),
+                            .child(language.text("PHIÊN VIẾT NÀY"))
+                            .child(ui_format!(
+                                language,
+                                "{} / {} từ",
+                                "{} / {} words",
+                                session_words,
+                                goal
+                            )),
                     )
                     .child(
                         div()
@@ -2024,7 +2660,7 @@ impl Oicha {
                             ),
                     )
                     .child(
-                        Self::button("goal", "Đặt mục tiêu")
+                        Self::button("goal", language.text("Đặt mục tiêu"))
                             .mt(px(7.))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.show_prompt(PromptKind::Goal, window, cx)
@@ -2034,6 +2670,7 @@ impl Oicha {
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let e = self.editors[self.active].read(cx);
         let style = e.engine.typing_style;
         div()
@@ -2150,12 +2787,14 @@ impl Oicha {
                                 cx.listener(|this, _, window, cx| this.toggle_vim(window, cx)),
                             ),
                     )
-                    .child(Self::button("focus", "Tập trung  ↗").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.focus_mode = !this.focus_mode;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        Self::button("focus", language.text("Tập trung  ↗")).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.focus_mode = !this.focus_mode;
+                                cx.notify();
+                            },
+                        )),
+                    ),
             )
     }
     fn font_change(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -2175,6 +2814,7 @@ impl Oicha {
     }
 
     fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let chapter = &self.book.chapters[self.active];
         let id = chapter.id;
         let words = chapter.body.words();
@@ -2192,7 +2832,7 @@ impl Oicha {
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
                     .mb(px(22.))
-                    .child("GÓC BẢN THẢO"),
+                    .child(language.text("GÓC BẢN THẢO")),
             )
             .child(
                 div()
@@ -2201,7 +2841,7 @@ impl Oicha {
                     .child(chapter.title.clone()),
             )
             .child(
-                Self::button("rename-chapter", "Đổi tên chương")
+                Self::button("rename-chapter", language.text("Đổi tên chương"))
                     .mt(px(7.))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.show_prompt(PromptKind::Chapter(id), window, cx)
@@ -2213,7 +2853,7 @@ impl Oicha {
                     .mb(px(12.))
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
-                    .child("GHI CHÚ & TÓM TẮT"),
+                    .child(language.text("GHI CHÚ & TÓM TẮT")),
             )
             .child(
                 div()
@@ -2233,7 +2873,9 @@ impl Oicha {
                     }))
                     .cursor_pointer()
                     .child(if chapter.synopsis.is_empty() {
-                        "Một chi tiết, một ý tưởng…\nNhấn để ghi lại.".into()
+                        language
+                            .text("Một chi tiết, một ý tưởng…\nNhấn để ghi lại.")
+                            .into()
                     } else {
                         chapter.synopsis.clone()
                     })
@@ -2246,13 +2888,16 @@ impl Oicha {
                     .mt(px(30.))
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
-                    .child("THỐNG KÊ CHƯƠNG"),
+                    .child(language.text("THỐNG KÊ CHƯƠNG")),
             )
             .children(
                 [
-                    (format!("{words}"), "Từ"),
-                    (format!("{chars}"), "Ký tự"),
-                    (format!("{} phút", words.div_ceil(200)), "Thời gian đọc"),
+                    (format!("{words}"), language.text("Từ")),
+                    (format!("{chars}"), language.text("Ký tự")),
+                    (
+                        ui_format!(language, "{} phút", "{} min", words.div_ceil(200)),
+                        language.text("Thời gian đọc"),
+                    ),
                 ]
                 .into_iter()
                 .map(|(value, label)| {
@@ -2281,7 +2926,7 @@ impl Oicha {
                             .on_click(cx.listener(|this, _, _, cx| this.reorder(1, cx))),
                     )
                     .child(
-                        Self::button("delete-chapter", "Xóa chương")
+                        Self::button("delete-chapter", language.text("Xóa chương"))
                             .text_color(rgb(0x976552))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.delete_chapter(window, cx)),
@@ -2300,7 +2945,9 @@ impl Oicha {
                             .text_size(px(13.))
                             .line_height(px(23.))
                             .text_color(rgb(0x737d67))
-                            .child("“Cứ viết. Một trang chưa hoàn hảo vẫn hơn một trang trắng.”"),
+                            .child(language.text(
+                                "“Cứ viết. Một trang chưa hoàn hảo vẫn hơn một trang trắng.”",
+                            )),
                     ),
             )
     }
@@ -2431,35 +3078,44 @@ impl Oicha {
     }
 
     fn prompt_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let prompt = self.prompt.as_ref().unwrap();
         let (badge, description, label) = match prompt.kind {
-            PromptKind::BookTitle => ("BẢN THẢO", "Đặt tên cho thế giới bạn đang viết.", "Lưu tên"),
+            PromptKind::BookTitle => (
+                language.text("BẢN THẢO"),
+                language.text("Đặt tên cho thế giới bạn đang viết."),
+                language.text("Lưu tên"),
+            ),
             PromptKind::Author => (
-                "BẢN THẢO",
-                "Tên tác giả hiển thị cùng bản thảo khi xuất file.",
-                "Lưu thay đổi",
+                language.text("BẢN THẢO"),
+                language.text("Tên tác giả hiển thị cùng bản thảo khi xuất file."),
+                language.text("Lưu thay đổi"),
             ),
             PromptKind::Chapter(_) => (
-                "CHƯƠNG",
-                "Một cái tên để gợi mở câu chuyện phía trước.",
-                "Lưu tên",
+                language.text("CHƯƠNG"),
+                language.text("Một cái tên để gợi mở câu chuyện phía trước."),
+                language.text("Lưu tên"),
             ),
             PromptKind::Synopsis(_) => (
-                "GHI CHÚ",
-                "Giữ ý tưởng, tình tiết và những điều cần nhớ ở đây.",
-                "Lưu ghi chú",
+                language.text("GHI CHÚ"),
+                language.text("Giữ ý tưởng, tình tiết và những điều cần nhớ ở đây."),
+                language.text("Lưu ghi chú"),
             ),
             PromptKind::Goal => (
-                "NHỊP VIẾT",
-                "Chọn mục tiêu từ 1 đến 100.000 từ cho mỗi phiên viết.",
-                "Lưu mục tiêu",
+                language.text("NHỊP VIẾT"),
+                language.text("Chọn mục tiêu từ 1 đến 100.000 từ cho mỗi phiên viết."),
+                language.text("Lưu mục tiêu"),
             ),
             PromptKind::Search => (
-                "TÌM KIẾM",
-                "Tìm từ hoặc cụm từ trong chương đang mở.",
-                "Tìm kiếm",
+                language.text("TÌM KIẾM"),
+                language.text("Tìm từ hoặc cụm từ trong chương đang mở."),
+                language.text("Tìm kiếm"),
             ),
-            PromptKind::Command => ("VIM", "Nhập lệnh rồi nhấn Enter để thực hiện.", "Thực hiện"),
+            PromptKind::Command => (
+                "VIM",
+                language.text("Nhập lệnh rồi nhấn Enter để thực hiện."),
+                language.text("Thực hiện"),
+            ),
         };
         let multiline = matches!(prompt.kind, PromptKind::Synopsis(_));
         let card =
@@ -2516,9 +3172,9 @@ impl Oicha {
                         .gap(px(12.))
                         .child(div().text_size(px(11.)).text_color(rgb(0x738077)).child(
                             if multiline {
-                                "Ctrl+Enter để lưu · Esc để hủy"
+                                language.text("Ctrl+Enter để lưu · Esc để hủy")
                             } else {
-                                "Enter để xác nhận · Esc để hủy"
+                                language.text("Enter để xác nhận · Esc để hủy")
                             },
                         ))
                         .child(
@@ -2526,10 +3182,15 @@ impl Oicha {
                                 .flex()
                                 .gap(px(8.))
                                 .child(
-                                    Self::modal_button("cancel-prompt", "Hủy", false, false)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.cancel_prompt(window, cx)
-                                        })),
+                                    Self::modal_button(
+                                        "cancel-prompt",
+                                        language.text("Hủy"),
+                                        false,
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.cancel_prompt(window, cx),
+                                    )),
                                 )
                                 .child(
                                     Self::modal_button("submit-prompt", label, true, false)
@@ -2543,6 +3204,7 @@ impl Oicha {
     }
 
     fn confirmation_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let confirmation = self.confirmation.as_ref().unwrap();
         let card = div()
             .w(px(500.))
@@ -2552,8 +3214,8 @@ impl Oicha {
             .gap(px(24.))
             .child(Self::modal_heading(
                 confirmation.title.clone(),
-                "Thao tác này sẽ thay đổi dữ liệu đã có.",
-                "XÁC NHẬN",
+                language.text("Thao tác này sẽ thay đổi dữ liệu đã có."),
+                language.text("XÁC NHẬN"),
             ))
             .child(
                 div()
@@ -2569,7 +3231,7 @@ impl Oicha {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0x738077))
-                    .child("Tab để chọn · Enter để xác nhận · Esc để hủy"),
+                    .child(language.text("Tab để chọn · Enter để xác nhận · Esc để hủy")),
             )
             .child(
                 div()
@@ -2577,11 +3239,14 @@ impl Oicha {
                     .justify_end()
                     .gap(px(8.))
                     .child(
-                        Self::modal_button("cancel-confirmation", "Hủy", false, false)
-                            .when(!self.modal_accept_selected, |d| d.border_color(rgb(GREEN)))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.close_modal(window, cx)),
-                            ),
+                        Self::modal_button(
+                            "cancel-confirmation",
+                            language.text("Hủy"),
+                            false,
+                            false,
+                        )
+                        .when(!self.modal_accept_selected, |d| d.border_color(rgb(GREEN)))
+                        .on_click(cx.listener(|this, _, window, cx| this.close_modal(window, cx))),
                     )
                     .child(
                         Self::modal_button("accept-confirmation", confirmation.label, true, true)
@@ -2597,52 +3262,68 @@ impl Oicha {
     }
 
     fn help_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let rows = [
             (
                 "i / a / I / A",
-                "Insert tại con trỏ / sau ký tự / đầu / cuối dòng",
+                language.text("Insert tại con trỏ / sau ký tự / đầu / cuối dòng"),
             ),
-            ("Esc", "Trở về Normal, kết thúc nhóm undo"),
+            ("Esc", language.text("Trở về Normal, kết thúc nhóm undo")),
             (
                 "h/l · j/k · gj/gk",
-                "Trái/phải · lên/xuống từng hàng hiển thị",
+                language.text("Trái/phải · lên/xuống từng hàng hiển thị"),
             ),
             (
                 "zz · 42zz",
-                "Đưa hàng có con trỏ vào giữa · đến dòng 42 rồi căn giữa",
+                language.text("Đưa hàng có con trỏ vào giữa · đến dòng 42 rồi căn giữa"),
             ),
-            ("gg / G · o / O", "Đầu/cuối chương · tạo dòng dưới/trên"),
+            (
+                "gg / G · o / O",
+                language.text("Đầu/cuối chương · tạo dòng dưới/trên"),
+            ),
             (
                 "v / V · d / y / c",
-                "Visual / Visual Line · xóa / sao chép / thay",
+                language.text("Visual / Visual Line · xóa / sao chép / thay"),
             ),
-            ("dd · yy · cc · 3dw", "Thao tác dòng và lệnh có số lần lặp"),
-            ("diw / daw / ciw", "Thao tác với từ trong / cả khoảng trắng"),
+            (
+                "dd · yy · cc · 3dw",
+                language.text("Thao tác dòng và lệnh có số lần lặp"),
+            ),
+            (
+                "diw / daw / ciw",
+                language.text("Thao tác với từ trong / cả khoảng trắng"),
+            ),
             (
                 "x X · D C · J · p P",
-                "Xóa ký tự / cuối dòng · nối dòng · dán",
+                language.text("Xóa ký tự / cuối dòng · nối dòng · dán"),
             ),
             (
                 "u / Ctrl+R · / · n / N",
-                "Undo / redo · tìm · kết quả tiếp/trước",
+                language.text("Undo / redo · tìm · kết quả tiếp/trước"),
             ),
-            ("Ctrl+S / Ctrl+Shift+S", "Lưu / lưu thành file mới"),
+            (
+                "Ctrl+S / Ctrl+Shift+S",
+                language.text("Lưu / lưu thành file mới"),
+            ),
             (
                 "Ctrl+O / Ctrl+N · /",
-                "Mở / bản thảo mới · tìm trong chương",
+                language.text("Mở / bản thảo mới · tìm trong chương"),
             ),
             (
                 "Ctrl+B/F · Ctrl+U/D",
-                "Vim Normal: lên/xuống trang · nửa trang",
+                language.text("Vim Normal: lên/xuống trang · nửa trang"),
             ),
-            ("Ctrl+B / I / U", "Định dạng trong Insert hoặc khi tắt Vim"),
+            (
+                "Ctrl+B / I / U",
+                language.text("Định dạng trong Insert hoặc khi tắt Vim"),
+            ),
             (
                 "Ctrl+Shift+E · F11 · F1",
-                "Xuất DOCX · tập trung · hướng dẫn",
+                language.text("Xuất DOCX · tập trung · hướng dẫn"),
             ),
         ];
         let card = div().w(px(740.)).p(px(30.)).flex().flex_col().gap(px(20.))
-            .child(Self::modal_heading("Viết theo nhịp của bạn".into(), "Các phím tắt để đôi tay theo kịp dòng suy nghĩ.", "PHÍM TẮT"))
+            .child(Self::modal_heading(language.text("Viết theo nhịp của bạn").into(), language.text("Các phím tắt để đôi tay theo kịp dòng suy nghĩ."), language.text("PHÍM TẮT")))
             .child(div().id("help-scroll").max_h(px(340.)).overflow_y_scroll()
                 .children(rows.into_iter().enumerate().map(|(index, (key, explanation))|
                     div().flex().items_center().gap(px(16.)).px(px(12.)).py(px(10.)).rounded(px(8.))
@@ -2651,8 +3332,8 @@ impl Oicha {
                         .child(div().text_size(px(12.)).line_height(px(20.)).text_color(rgb(INK)).child(explanation)))))
             .child(div().flex().items_center().justify_between().gap(px(24.))
                 .child(div().flex_1().text_size(px(11.)).line_height(px(18.)).text_color(rgb(0x738077))
-                    .child("Cuộn để xem thêm. Bật/tắt bằng nút VIM. Chưa hỗ trợ macro, plugin và toàn bộ lệnh Ex."))
-                .child(Self::modal_button("close-help", "Đóng · Esc", true, false)
+                    .child(language.text("Cuộn để xem thêm. Bật/tắt bằng nút VIM. Chưa hỗ trợ macro, plugin và toàn bộ lệnh Ex.")))
+                .child(Self::modal_button("close-help", language.text("Đóng · Esc"), true, false)
                     .on_click(cx.listener(|this, _, window, cx| this.close_modal(window, cx)))));
         self.modal_shell(card, cx)
     }
@@ -2660,6 +3341,7 @@ impl Oicha {
 
 impl Render for Oicha {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
         let editor = &self.editors[self.active];
         let mode = editor.read(cx).engine.mode.label();
         let position = editor.read(cx).engine.position();
@@ -2699,42 +3381,51 @@ impl Render for Oicha {
                             .flex()
                             .items_center()
                             .gap(px(3.))
-                            .child(Self::button("new-book", "Bản thảo mới").on_click(
-                                cx.listener(|this, _, window, cx| this.new_book(window, cx)),
-                            ))
                             .child(
-                                Self::button("open", "Mở").on_click(
+                                Self::button("new-book", language.text("Bản thảo mới")).on_click(
+                                    cx.listener(|this, _, window, cx| this.new_book(window, cx)),
+                                ),
+                            )
+                            .child(
+                                Self::button("open", language.text("Mở")).on_click(
                                     cx.listener(|this, _, window, cx| this.open(window, cx)),
                                 ),
                             )
                             .child(
-                                Self::button("save", if self.saving { "Đang lưu…" } else { "Lưu" })
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.save(window, cx)),
-                                    ),
+                                Self::button(
+                                    "save",
+                                    if self.saving {
+                                        language.text("Đang lưu…")
+                                    } else {
+                                        language.text("Lưu")
+                                    },
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                             )
-                            .child(Self::button("save-as", "Lưu thành…").on_click(
-                                cx.listener(|this, _, window, cx| this.save_as(window, cx)),
-                            )),
+                            .child(
+                                Self::button("save-as", language.text("Lưu thành…")).on_click(
+                                    cx.listener(|this, _, window, cx| this.save_as(window, cx)),
+                                ),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .child(Self::button("find", "Tìm kiếm").on_click(cx.listener(
-                                |this, _, window, cx| {
+                            .child(Self::button("find", language.text("Tìm kiếm")).on_click(
+                                cx.listener(|this, _, window, cx| {
                                     this.show_prompt(PromptKind::Search, window, cx)
-                                },
-                            )))
-                            .child(Self::button("help", "Phím tắt").on_click(
+                                }),
+                            ))
+                            .child(Self::button("help", language.text("Phím tắt")).on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_help(window, cx)),
                             ))
                             .child(Self::button("export-txt", "TXT").on_click(
                                 cx.listener(|this, _, window, cx| this.export(true, window, cx)),
                             ))
                             .child(
-                                Self::button("export", "Xuất DOCX  ↗")
+                                Self::button("export", language.text("Xuất DOCX  ↗"))
                                     .bg(rgb(GREEN))
                                     .text_color(rgb(0xffffff))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2760,13 +3451,15 @@ impl Render for Oicha {
                                 .or_else(|| self.notice.clone())
                                 .unwrap_or_default(),
                         )
-                        .child(Self::button("dismiss-error", "Đóng").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.error = None;
-                                this.notice = None;
-                                cx.notify();
-                            },
-                        ))),
+                        .child(
+                            Self::button("dismiss-error", language.text("Đóng")).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.error = None;
+                                    this.notice = None;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
                 )
             })
             .child(
@@ -2811,21 +3504,31 @@ impl Render for Oicha {
                                     .rounded(px(3.))
                                     .bg(rgb(GREEN))
                                     .text_color(rgb(0xffffff))
-                                    .child(if self.vim { mode } else { "SOẠN THẢO" }),
+                                    .child(if self.vim {
+                                        mode
+                                    } else {
+                                        language.text("SOẠN THẢO")
+                                    }),
                             )
-                            .child(div().text_color(rgb(MUTED)).child(format!(
+                            .child(div().text_color(rgb(MUTED)).child(ui_format!(
+                                language,
                                 "Dòng {} · Cột {}  {}",
-                                position.0, position.1, pending
+                                "Line {} · Column {}  {}",
+                                position.0,
+                                position.1,
+                                pending
                             )))
                             .child(div().text_color(rgb(MUTED)).child(self.status.clone())),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{} từ  ·  UTF-8  ·  GPUI", self.book.words())),
-                    ),
+                    .child(div().text_color(rgb(MUTED)).child(ui_format!(
+                        language,
+                        "{} từ  ·  UTF-8  ·  GPUI",
+                        "{} words  ·  UTF-8  ·  GPUI",
+                        self.book.words()
+                    ))),
             )
             .when(self.help, |d| d.child(self.help_overlay(cx)))
+            .when(self.settings, |d| d.child(self.settings_overlay(cx)))
             .when(self.prompt.is_some(), |d| d.child(self.prompt_overlay(cx)))
             .when(self.confirmation.is_some(), |d| {
                 d.child(self.confirmation_overlay(cx))

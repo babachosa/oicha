@@ -170,6 +170,7 @@ struct Layout {
 }
 
 pub struct TextEditor {
+    pub language: crate::settings::Language,
     pub engine: Editor,
     pub focus: FocusHandle,
     pub font_size: f32,
@@ -323,6 +324,7 @@ impl TextEditor {
             spacing: if compact { 1.6 } else { 1.85 },
             compact,
             multiline: !compact,
+            language: crate::settings::Language::Vi,
             scroll: ScrollHandle::new(),
             layout: None,
             motion_layout_key: None,
@@ -1498,6 +1500,7 @@ impl Element for ManuscriptElement {
         let block = e.engine.vim && e.engine.mode != Mode::Insert;
         let blink = e.blink;
         let compact = e.compact;
+        let language = e.language;
         let empty = e.engine.body.text.is_empty();
         let marked = e.marked.clone();
         window.handle_input(
@@ -1626,9 +1629,9 @@ impl Element for ManuscriptElement {
         }
         if empty {
             let placeholder: SharedString = if compact {
-                "Nhập tại đây…"
+                language.text("Nhập tại đây…")
             } else {
-                "Nhấn i để bắt đầu câu chuyện của bạn…"
+                language.text("Nhấn i để bắt đầu câu chuyện của bạn…")
             }
             .into();
             let line = window.text_system().shape_line(

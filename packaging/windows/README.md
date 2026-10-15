@@ -1,5 +1,10 @@
 # Windows packaging
 
+The current language/updater release is 0.2.1. See `UPDATES.md` for signed update
+metadata, the release workflow and key handling, and `LANGUAGE_UPDATE_VALIDATION.md`
+for the actual 0.2.0 → 0.2.1 upgrade and installed-app QA. Setup now preserves an
+explicitly unselected Start Menu component during silent upgrades as well.
+
 Build on Windows x64 with PowerShell 7.2+, the pinned Rust toolchain and a licensed
 Visual Studio C++ installation including its x64 redistributable CRT directory:
 

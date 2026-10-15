@@ -4,7 +4,7 @@
 
 ## Chạy trên Windows
 
-Bộ cài: `dist/Oicha-0.1.0-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
+Bộ cài: `dist/Oicha-0.2.1-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
 
 Để tự build từ mã nguồn:
 
@@ -19,6 +19,13 @@ cargo run -p oicha --release --locked -- "D:\Ban-thao\Tieu-thuyet.oicha"
 Build xong, chạy trực tiếp `target/release/oicha.exe`. Không cần Node, trình duyệt hay dịch vụ đám mây. Lần đầu mở có bản thảo mẫu **Mùa gió đi qua**; chọn **Bản thảo mới** để viết sách riêng.
 
 Build bộ cài bằng PowerShell 7.2+: `./tools/build-windows-installer.ps1`. Xem `packaging/windows/README.md` và `WINDOWS_INSTALLER_VALIDATION.md` để biết pipeline, checksum, runtime đóng gói và kết quả kiểm thử cài/gỡ.
+
+
+## Ngôn ngữ và cập nhật
+
+Mở **Cài đặt** ở thanh tiêu đề, chọn **Tiếng Việt** hoặc **English**. Giao diện đổi ngay và nhớ lựa chọn cho lần mở sau; nội dung bản thảo giữ nguyên. Trong cùng mục này có kiểm tra, tải và khởi động lại để cập nhật. App cũng kiểm tra GitHub Releases khi khởi động và hiện thông báo trên nút Cài đặt nếu có bản mới.
+
+Gói cập nhật được xác minh chữ ký Ed25519 và SHA-256 trước khi chạy; phải lưu xong bản thảo mới đóng app để nâng cấp. Khóa ký cập nhật độc lập với chứng thư Windows. Bản 0.1.0 cần cài thủ công bản mới lần đầu. Xem [UPDATES.md](UPDATES.md) cho quy trình phát hành và kiểm thử.
 
 ## Chức năng
 
@@ -94,7 +101,7 @@ crates/oicha-app/
   main.rs         Native application lifecycle
 ```
 
-Lõi không phụ thuộc UI. GPUI định hình chữ qua font hệ điều hành, cache layout theo generation/width/font; chỉ paint đoạn trong viewport. I/O lưu bản thảo chạy trên background executor. Không dùng unsafe trong mã ứng dụng. Các thư viện nền và API hệ điều hành vẫn có native dependencies; “Rust” ở đây là toàn bộ mã ứng dụng/lõi, không phải viết lại hệ điều hành hoặc driver.
+Lõi không phụ thuộc UI. GPUI định hình chữ qua font hệ điều hành, cache layout theo generation/width/font; chỉ paint đoạn trong viewport. I/O lưu bản thảo chạy trên background executor. Mã soạn thảo không dùng unsafe. Helper cập nhật có một đoạn Win32 nhỏ để chờ tiến trình cũ thoát, với hợp đồng an toàn được ghi rõ tại chỗ. Các thư viện nền và API hệ điều hành vẫn có native dependencies; “Rust” ở đây là toàn bộ mã ứng dụng/lõi, không phải viết lại hệ điều hành hoặc driver.
 
 ```powershell
 cargo fmt --all --check

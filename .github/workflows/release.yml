@@ -1,0 +1,51 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate release tag and signing configuration
+        shell: pwsh
+        env:
+          UPDATE_KEY: ${{ secrets.OICHA_UPDATE_PRIVATE_KEY }}
+        run: |
+          if (!$env:UPDATE_KEY) { throw 'Set the OICHA_UPDATE_PRIVATE_KEY repository secret first' }
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'oicha').version
+          if ($env:GITHUB_REF -ne "refs/tags/v$version") { throw 'Run this workflow on the exact release tag' }
+          "OICHA_VERSION=$version" >> $env:GITHUB_ENV
+      - run: cargo fmt --all --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: ./tools/check-dependencies.ps1
+      - run: cargo build -p oicha --release --locked
+      - run: ./tools/build-windows-installer.ps1 -SkipBuild
+      - name: Sign update metadata
+        shell: pwsh
+        env:
+          UPDATE_KEY: ${{ secrets.OICHA_UPDATE_PRIVATE_KEY }}
+        run: |
+          $key = Join-Path $env:RUNNER_TEMP 'oicha-update.pk8'
+          try {
+            [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:UPDATE_KEY))
+            cargo run -p oicha-update --bin oicha-release --release --locked -- sign $key $env:OICHA_VERSION "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe" packaging/RELEASE_NOTES.md dist/oicha-update.json
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+          } finally { if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key } }
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$env:OICHA_VERSION" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe.sha256" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe.manifest.json" dist/oicha-update.json --verify-tag --title "Oicha $env:OICHA_VERSION" --notes-file packaging/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

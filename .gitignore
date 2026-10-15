@@ -5,4 +5,9 @@
 *.oicha.lock
 /artifacts/
 /dist/
+*.pk8
+*.pfx
+*.p12
+.env
+.env.*
 

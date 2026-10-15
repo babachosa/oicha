@@ -1,8 +1,14 @@
 #requires -Version 7.2
-param([string]$Installer = 'dist/Oicha-0.1.0-Windows-x64-Setup.exe', [string]$OutputDirectory = 'artifacts/installer-qa')
+param([string]$Installer, [string]$OutputDirectory = 'artifacts/installer-qa')
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $workspace
+if (!$Installer) {
+    $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+    $version = ($metadata.packages | Where-Object name -eq 'oicha').version
+    $Installer = "dist/Oicha-$version-Windows-x64-Setup.exe"
+}
 $installerPath = (Resolve-Path -LiteralPath $Installer).Path
 $appKey = 'HKCU:/Software/Oicha'
 $uninstallKey = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/Oicha'
