@@ -395,22 +395,38 @@ impl TextEditor {
         self.autoscroll = false;
         self.center_cursor = false;
         self.advance_page = false;
-        if self.compact || event.delta.precise() {
-            // Precision touchpads already supply continuous motion and inertia.
+        if self.compact {
+            // Popup inputs retain GPUI's native scrolling.
             self.scroll_motion = None;
             self.scroll_written = None;
             return;
         }
-        let delta = event.delta.pixel_delta(window.line_height());
-        let delta = if delta.y == px(0.) { delta.x } else { delta.y };
-        // GPUI 0.2 registers its built-in bubble listener after user listeners,
-        // so it has already added this delta. Replace that step with motion.
-        let mut offset = self.scroll.offset();
-        offset.y -= delta;
-        self.scroll.set_offset(offset);
-        self.scroll_to(self.scroll_target() + delta, Instant::now());
+        // This listener runs before GPUI's built-in scroll handler. Never undo
+        // a native delta: its line height belongs to the painted element's style,
+        // which need not match the event-dispatch context's line height.
         window.prevent_default();
         cx.stop_propagation();
+        if self
+            .scroll_written
+            .is_some_and(|last| (last - self.scroll.offset().y).abs() > px(0.5))
+        {
+            self.scroll_motion = None;
+            self.scroll_written = None;
+        }
+        let delta = event.delta.pixel_delta(window.line_height());
+        let delta = if delta.y == px(0.) { delta.x } else { delta.y };
+        if event.delta.precise() {
+            // Keep touchpad deltas/inertia immediate, but within the same bounds.
+            let mut offset = self.scroll.offset();
+            offset.y = (offset.y + delta)
+                .max(-self.scroll.max_offset().height)
+                .min(px(0.));
+            self.scroll_motion = None;
+            self.scroll_written = None;
+            self.scroll.set_offset(offset);
+        } else {
+            self.scroll_to(self.scroll_target() + delta, Instant::now());
+        }
         cx.notify();
     }
 
@@ -1140,6 +1156,15 @@ impl TextEditor {
             self.engine.anchor = self.engine.snap(start);
             self.engine.cursor = self.engine.snap(end);
         }
+        if !self.compact
+            && self
+                .layout
+                .as_ref()
+                .and_then(|l| l.rows.first())
+                .is_some_and(|row| row.y == self.cursor_position(self.engine.cursor).y)
+        {
+            self.autoscroll = true;
+        }
         self.blink = true;
         cx.emit(EditorEvent::State);
         cx.notify();
@@ -1404,6 +1429,10 @@ impl Element for ManuscriptElement {
                     offset.y +=
                         viewport.top() + viewport.size.height / 2. - caret - e.line_height() / 2.;
                     offset.y = offset.y.max(-e.scroll.max_offset().height).min(px(0.));
+                } else if layout.rows.first().is_some_and(|row| row.y == row_y) {
+                    // Reveal the page's full top margin and surrounding space,
+                    // even if the first row's glyphs already fit in the viewport.
+                    offset.y = px(0.);
                 } else if advance_page
                     && e.engine.cursor == e.engine.body.text.len()
                     && caret + e.line_height() / 2. >= viewport.top() + viewport.size.height * 0.65
@@ -1683,7 +1712,7 @@ impl Render for TextEditor {
             .child(ManuscriptElement {
                 editor: cx.entity(),
             });
-        div()
+        let scroller = div()
             .id("editor-scroll")
             .size_full()
             .min_h_0()
@@ -1696,7 +1725,6 @@ impl Render for TextEditor {
             .key_context("Manuscript")
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::on_key))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(
@@ -1723,7 +1751,21 @@ impl Render for TextEditor {
                         .w_full()
                         .flex_shrink_0(),
                 )
-            })
+            });
+        // A non-occluding sibling handles wheel input before the scroller's
+        // built-in bubble listener. Cover the whole viewport, including the
+        // margins and tail space, without intercepting clicks or selection.
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .child(scroller)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_scroll_wheel(cx.listener(Self::scroll_wheel)),
+            )
     }
 }
 

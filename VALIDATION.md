@@ -1,6 +1,6 @@
 # Validation — 2026-10-16
 
-Latest candidate: **0.2.1**. See [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md) for the current app/installer hashes, language checks and actual signed update test. Earlier evidence below is historical.
+Latest candidate: **0.2.2**. See [SCROLL_EDGE_VALIDATION.md](SCROLL_EDGE_VALIDATION.md) for current hashes, native scroll regressions and the actual signed 0.2.1 → 0.2.2 update test. Language/updater baseline evidence is in [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md). Earlier evidence below is historical.
 
 Windows x64, Rust 1.98.1 MSVC, GPUI 0.2.2. This records the candidate after fixing all six findings from the earlier production review and updating popup presentation/lifecycle, zz, end scroll space and Enter-at-EOF page advance, fixed A4 display pages, automatic soft-wrap follow, smooth typing/scroll motion, bundled Vietnamese Literata typography with clean page surfaces, whole-word Vietnamese wrapping and an integrated titlebar.
 

@@ -4,7 +4,7 @@
 
 ## Chạy trên Windows
 
-Bộ cài: `dist/Oicha-0.2.1-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
+Bộ cài: `dist/Oicha-0.2.2-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
 
 Để tự build từ mã nguồn:
 
@@ -28,6 +28,9 @@ Mở **Cài đặt** ở thanh tiêu đề, chọn **Tiếng Việt** hoặc **E
 Gói cập nhật được xác minh chữ ký Ed25519 và SHA-256 trước khi chạy; phải lưu xong bản thảo mới đóng app để nâng cấp. Khóa ký cập nhật độc lập với chứng thư Windows. Bản 0.1.0 cần cài thủ công bản mới lần đầu. Xem [UPDATES.md](UPDATES.md) cho quy trình phát hành và kiểm thử.
 
 ## Chức năng
+
+- Khi về hàng hiển thị đầu tiên, trang tự hiện trọn lề trên và khoảng thoáng phía trên; áp dụng với bàn phím và nhấp chuột. Cuộn tiếp ở đầu/cuối trang không đẩy trang vượt biên rồi bật lại; đổi hướng cuộn có hiệu lực ngay.
+
 
 - Tạo, đổi tên, sắp xếp và xóa chương; ghi chú/tóm tắt riêng từng chương; đổi tên sách và tác giả.
 - Popup nhập liệu, phím tắt và xác nhận cùng một thiết kế: mở bằng fade/slide 200 ms, đóng 120 ms, nền dịu, bo góc và bóng mềm. Esc hoặc nhấn nền ngoài để hủy; Ctrl+Enter lưu ghi chú nhiều dòng. Xác nhận xóa/ghi đè chọn Hủy mặc định, Tab đổi lựa chọn rồi Enter xác nhận.

@@ -140,6 +140,62 @@ impl Oicha {
     /// Isolated visual QA, available only under the explicit smoke-test flag.
     pub fn preview_popup(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
+            "scroll-edges" => {
+                self.editors[self.active].update(cx, |e, cx| {
+                    e.engine = oicha_core::editor::Editor::new(RichText::plain(
+                        "Một hàng tiếng Việt để kiểm tra cuộn trang.\n".repeat(100),
+                    ));
+                    e.reveal_cursor(cx);
+                    cx.emit(EditorEvent::Changed);
+                });
+                let path = self
+                    .path
+                    .as_ref()
+                    .unwrap()
+                    .with_extension("scroll-probe.json");
+                let command = path.with_extension("command.json");
+                let editor = self.editors[self.active].clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    let mut last = 0;
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(16)).await;
+                        if cx.update(|window, cx| {
+                            if let Ok(bytes) = std::fs::read(&command)
+                                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                                && let Some(id) = value["id"].as_u64()
+                                && id > last {
+                                last = id;
+                                editor.update(cx, |e, cx| {
+                                    match value["action"].as_str().unwrap_or("") {
+                                        "top" => e.scroll.set_offset(point(px(0.), px(0.))),
+                                        "bottom" => e.scroll.set_offset(point(px(0.), -e.scroll.max_offset().height)),
+                                        "partial" => e.scroll.set_offset(point(px(0.), px(-80.))),
+                                        "first" => { e.engine.move_to(3, false); e.reveal_cursor(cx); }
+                                        "second" => { e.engine.move_to(e.engine.body.text.find('\n').unwrap() + 1, false); e.reveal_cursor(cx); }
+                                        "novim" => { if e.engine.vim { e.engine.toggle_vim(); } }
+                                        "vim" => { if !e.engine.vim { e.engine.toggle_vim(); } }
+                                        "pixels-top" | "pixels-bottom" => {
+                                            let delta = if value["action"] == "pixels-top" { 10_000. } else { -10_000. };
+                                            let event = ScrollWheelEvent { position: e.scroll.bounds().center(), delta: ScrollDelta::Pixels(point(px(0.), px(delta))), ..Default::default() };
+                                            e.scroll_wheel(&event, window, cx);
+                                        }
+                                        _ => {}
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                            let e = editor.read(cx);
+                            if e.scroll.bounds().size.height <= px(0.) { return; }
+                            let (middle, height) = e.cursor_viewport_geometry();
+                            let (_, _, target, active) = e.motion_probe();
+                            let bounds = e.scroll.bounds();
+                            let value = serde_json::json!({"command": last, "offset": f32::from(e.scroll.offset().y), "target": f32::from(target), "active": active, "max": f32::from(e.scroll.max_offset().height), "caret": f32::from(middle), "height": f32::from(height), "viewport": [f32::from(bounds.left()), f32::from(bounds.top()), f32::from(bounds.size.width), f32::from(bounds.size.height)], "generation": e.engine.generation});
+                            let _ = atomic_write(&path, &serde_json::to_vec(&value).unwrap());
+                            let _ = window;
+                        }).is_err() { break; }
+                    }
+                }).detach();
+            }
             "settings" | "settings-en" => {
                 if kind == "settings-en" {
                     self.set_language(Language::En, window, cx);
@@ -386,8 +442,8 @@ impl Oicha {
                     anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text.matches('\n').count())? == page_text.matches('\n').count(), "Soft wrapping inserted a real newline");
                     cx.update(|_, cx| editor.read(cx).validate_page_geometry())?;
                     if vim {
-                        // Exercise the wheel callback after GPUI's native delta
-                        // stage, including precision input interrupting motion.
+                        // Exercise smooth/precision input before the native delta.
+                        // Real Windows dispatch is covered by native-scroll-smoke.ps1.
                         let before = cx.update(|_, cx| editor.read(cx).scroll.offset().y)?;
                         cx.update(|window, cx| {
                             let position = editor.read(cx).scroll.bounds().center();
@@ -395,8 +451,7 @@ impl Oicha {
                                 position, delta: ScrollDelta::Lines(point(0., 3.)), ..Default::default()
                             };
                             editor.update(cx, |e, cx| {
-                                let mut offset = e.scroll.offset(); offset.y += event.delta.pixel_delta(window.line_height()).y;
-                                e.scroll.set_offset(offset); e.scroll_wheel(&event, window, cx);
+                                e.scroll_wheel(&event, window, cx);
                             });
                         })?;
                         anyhow::ensure!(cx.update(|_, cx| editor.read(cx).scroll.offset().y)? == before, "Wheel jumped before an animation frame");
@@ -413,8 +468,7 @@ impl Oicha {
                                 position, delta: ScrollDelta::Lines(point(0., -3.)), ..Default::default()
                             };
                             editor.update(cx, |e, cx| {
-                                let mut offset = e.scroll.offset(); offset.y += event.delta.pixel_delta(window.line_height()).y;
-                                e.scroll.set_offset(offset); e.scroll_wheel(&event, window, cx);
+                                e.scroll_wheel(&event, window, cx);
                             });
                         })?;
                         cx.background_executor().timer(Duration::from_millis(30)).await;
@@ -424,8 +478,7 @@ impl Oicha {
                                 position, delta: ScrollDelta::Pixels(point(px(0.), px(8.))), ..Default::default()
                             };
                             editor.update(cx, |e, cx| {
-                                let mut offset = e.scroll.offset(); offset.y += event.delta.pixel_delta(window.line_height()).y;
-                                e.scroll.set_offset(offset); e.scroll_wheel(&event, window, cx);
+                                e.scroll_wheel(&event, window, cx);
                             });
                         })?;
                         let interrupted = cx.update(|_, cx| editor.read(cx).scroll.offset())?;

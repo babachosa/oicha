@@ -47,5 +47,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $draft = gh release view "v$env:OICHA_VERSION" --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if ($draft -ne 'false') { throw 'An unpublished draft already exists; complete or remove it before retrying' }
+            Write-Output 'This release already exists; preserving its original signed assets.'
+            exit 0
+          }
           gh release create "v$env:OICHA_VERSION" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe.sha256" "dist/Oicha-$env:OICHA_VERSION-Windows-x64-Setup.exe.manifest.json" dist/oicha-update.json --verify-tag --title "Oicha $env:OICHA_VERSION" --notes-file packaging/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

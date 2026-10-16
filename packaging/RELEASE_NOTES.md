@@ -1,14 +1,11 @@
-Oicha now includes Vietnamese and English interface languages. Open Settings in
-the title bar, choose Tiếng Việt or English, and keep writing without restarting.
-The choice is saved locally; changing it never translates or modifies a manuscript.
+Oicha 0.2.2 fixes two scrolling issues on Windows:
 
-Signed in-app updates are available from Settings. Oicha checks GitHub Releases,
-verifies the Ed25519 signature and SHA-256 of the installer, saves the current
-manuscript, and uses a separate Rust helper to upgrade and restart the installed app.
-Network and verification failures leave the current installation in place. A failed
-manuscript save blocks restart. Portable/development copies require Setup first.
+- Moving the cursor to the first display row now reveals the entire top margin
+  and space above the page, including with Arrow Up and mouse clicks.
+- Repeated scrolling past the top or bottom no longer makes the page flicker.
+  Wheel events are handled once, offsets are clamped before drawing, and reversing
+  direction works immediately. Precision touchpad input remains immediate.
 
-The Windows installer remains unsigned with Authenticode; update metadata has its
-own cryptographic signature. The first upgrade from 0.1.0 requires running Setup.
-
-This release also updates rustls to 0.23.46 to resolve newly published TLS advisories.
+Smooth scrolling, Vim motions, the writing space below the last row, Vietnamese/
+English interface selection, saved manuscripts and signed updates remain available.
+The Windows installer remains unsigned with Authenticode; update metadata is signed.

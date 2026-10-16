@@ -14,8 +14,12 @@ $appKey = 'HKCU:/Software/Oicha'
 $uninstallKey = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/Oicha'
 $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Oicha/Oicha.lnk'
 $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Oicha.lnk'
-foreach ($path in @($appKey,$uninstallKey,$menu,$desktop,'HKCU:/Software/Classes/Oicha.Manuscript')) {
+foreach ($path in @($appKey,$uninstallKey,'HKCU:/Software/Classes/Oicha.Manuscript')) {
     if (Test-Path -LiteralPath $path) { throw "Preserving the existing user installation: $path" }
+}
+$originalLinks = @{}
+foreach ($link in @($menu,$desktop)) {
+    $originalLinks[$link] = $(if (Test-Path -LiteralPath $link) { (Get-FileHash -LiteralPath $link).Hash } else { $null })
 }
 $root = Join-Path $workspace ('artifacts/update-qa-' + [Guid]::NewGuid().ToString('N'))
 $installed = Join-Path $root 'Cập nhật có khoảng trắng'
@@ -46,7 +50,10 @@ try {
         if ((Get-FileHash -LiteralPath (Join-Path $installed $file.path)).Hash -ne $file.sha256) { throw "Updated payload mismatch: $($file.path)" }
     }
     if ((Get-ItemProperty -LiteralPath $appKey).Version -ne $manifest.version) { throw 'Registry version mismatch' }
-    foreach ($link in @($menu,$desktop)) { if (Test-Path -LiteralPath $link) { throw 'Upgrade changed an unselected shortcut option' } }
+    foreach ($link in @($menu,$desktop)) {
+        $hash = $(if (Test-Path -LiteralPath $link) { (Get-FileHash -LiteralPath $link).Hash } else { $null })
+        if ($hash -ne $originalLinks[$link]) { throw 'Upgrade changed an unselected shortcut option or an existing user shortcut' }
+    }
     if ([IO.File]::ReadAllText($kept) -ne 'User file must survive update and uninstall') { throw 'Upgrade changed a user file' }
     $book = Get-Content -LiteralPath $document -Raw | ConvertFrom-Json
     if ($book.chapters[0].body.text -notmatch 'UPDATE_PRESERVE: Tiếng Việt 🌿 — unsaved text') { throw 'Unsaved text did not survive' }
