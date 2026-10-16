@@ -1,11 +1,9 @@
-Oicha 0.2.2 fixes two scrolling issues on Windows:
+Oicha 0.2.3 fixes vertical cursor movement with the arrow keys.
 
-- Moving the cursor to the first display row now reveals the entire top margin
-  and space above the page, including with Arrow Up and mouse clicks.
-- Repeated scrolling past the top or bottom no longer makes the page flicker.
-  Wheel events are handled once, offsets are clamped before drawing, and reversing
-  direction works immediately. Precision touchpad input remains immediate.
+After End or a Vim end-of-line motion, Arrow Up/Down now use the cursor's current
+horizontal position instead of jumping to the end of a longer row. Moving through
+short rows preserves the original horizontal goal and restores it on longer rows.
+This works with Vim enabled or disabled. Explicit Vim j/k end-of-line behavior is
+preserved; the first-row margin reveal and scroll-boundary fixes from 0.2.2 remain.
 
-Smooth scrolling, Vim motions, the writing space below the last row, Vietnamese/
-English interface selection, saved manuscripts and signed updates remain available.
 The Windows installer remains unsigned with Authenticode; update metadata is signed.

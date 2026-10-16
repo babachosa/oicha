@@ -172,8 +172,18 @@ impl Oicha {
                                         "partial" => e.scroll.set_offset(point(px(0.), px(-80.))),
                                         "first" => { e.engine.move_to(3, false); e.reveal_cursor(cx); }
                                         "second" => { e.engine.move_to(e.engine.body.text.find('\n').unwrap() + 1, false); e.reveal_cursor(cx); }
+                                        "middle" => { e.engine.move_to(e.engine.body.text.find('\n').unwrap() + 1 + "Một hàng".len(), false); e.reveal_cursor(cx); }
+                                        "wide" => { e.engine.move_to(30, false); e.reveal_cursor(cx); }
+                                        "dollar" => { e.engine.key("$"); e.reveal_cursor(cx); }
+                                        "cursor-fixture" => {
+                                            let generation = e.engine.generation + 1;
+                                            e.engine = oicha_core::editor::Editor::new(RichText::plain("A long first row with enough room to move vertically.\nA shorter row.\nAnother long row to return to the original horizontal position."));
+                                            e.engine.generation = generation;
+                                            e.reveal_cursor(cx);
+                                            cx.emit(EditorEvent::Changed);
+                                        }
                                         "novim" => { if e.engine.vim { e.engine.toggle_vim(); } }
-                                        "vim" => { if !e.engine.vim { e.engine.toggle_vim(); } }
+                                        "vim" => { if !e.engine.vim { e.engine.toggle_vim(); } e.engine.escape(); }
                                         "pixels-top" | "pixels-bottom" => {
                                             let delta = if value["action"] == "pixels-top" { 10_000. } else { -10_000. };
                                             let event = ScrollWheelEvent { position: e.scroll.bounds().center(), delta: ScrollDelta::Pixels(point(px(0.), px(delta))), ..Default::default() };
@@ -189,7 +199,8 @@ impl Oicha {
                             let (middle, height) = e.cursor_viewport_geometry();
                             let (_, _, target, active) = e.motion_probe();
                             let bounds = e.scroll.bounds();
-                            let value = serde_json::json!({"command": last, "offset": f32::from(e.scroll.offset().y), "target": f32::from(target), "active": active, "max": f32::from(e.scroll.max_offset().height), "caret": f32::from(middle), "height": f32::from(height), "viewport": [f32::from(bounds.left()), f32::from(bounds.top()), f32::from(bounds.size.width), f32::from(bounds.size.height)], "generation": e.engine.generation});
+                            let point = e.cursor_screen_point();
+                            let value = serde_json::json!({"command": last, "offset": f32::from(e.scroll.offset().y), "target": f32::from(target), "active": active, "max": f32::from(e.scroll.max_offset().height), "caret": f32::from(middle), "height": f32::from(height), "viewport": [f32::from(bounds.left()), f32::from(bounds.top()), f32::from(bounds.size.width), f32::from(bounds.size.height)], "generation": e.engine.generation, "cursor": e.engine.cursor, "anchor": e.engine.anchor, "x": f32::from(point.x), "y": f32::from(point.y)});
                             let _ = atomic_write(&path, &serde_json::to_vec(&value).unwrap());
                             let _ = window;
                         }).is_err() { break; }

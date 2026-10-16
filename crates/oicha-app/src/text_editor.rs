@@ -492,6 +492,9 @@ impl TextEditor {
         if matches!(key, "f1" | "f11") {
             return;
         }
+        if matches!(key, "up" | "down") && !stroke.modifiers.control && !stroke.modifiers.platform {
+            self.engine.use_finite_vertical_column();
+        }
         if stroke.modifiers.control || stroke.modifiers.platform {
             if self.engine.vim && self.engine.mode != Mode::Insert && !stroke.modifiers.shift {
                 let rows = (f32::from(self.scroll.bounds().size.height)

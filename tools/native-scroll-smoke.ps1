@@ -1,5 +1,5 @@
 #requires -Version 7.2
-param([string]$Executable = 'target/release/oicha.exe', [string]$OutputDirectory, [switch]$ExpectFailure)
+param([string]$Executable = 'target/release/oicha.exe', [string]$OutputDirectory, [switch]$ExpectFailure, [switch]$CursorOnly)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
 $exe = (Resolve-Path -LiteralPath $Executable).Path
@@ -63,6 +63,55 @@ try {
     $null = [OichaScrollProbe]::GetWindowThreadProcessId($handle,[ref]$owner)
     if ($owner -ne $process.Id -or $process.Path -ne $exe) { throw 'Refusing to send input to a window outside this fixture' }
     $initial = Read-Probe
+    if ($CursorOnly) {
+        Send-Command cursor-fixture
+        Start-Sleep -Milliseconds 200
+        $generation = (Read-Probe).generation
+        foreach ($case in @(
+            @{name='arrow-from-middle'; mode='vim'; first=0; key=38},
+            @{name='k-from-middle'; mode='vim'; first=0; key=75},
+            @{name='arrow-after-End'; mode='vim'; first=35; key=38},
+            @{name='arrow-after-dollar'; mode='vim'; first=-1; key=38},
+            @{name='arrow-no-vim'; mode='novim'; first=0; key=38}
+        )) {
+            Send-Command $case.mode
+            Send-Command middle
+            if ($case.first -eq -1) { Send-Command dollar }
+            elseif ($case.first) {
+                $null = [OichaScrollProbe]::SendMessageW($handle,0x0100,[IntPtr]$case.first,[IntPtr]::Zero)
+                $null = [OichaScrollProbe]::SendMessageW($handle,0x0101,[IntPtr]$case.first,[IntPtr]::Zero)
+            }
+            Start-Sleep -Milliseconds 200
+            $before = Read-Probe
+            $null = [OichaScrollProbe]::SendMessageW($handle,0x0100,[IntPtr]$case.key,[IntPtr]::Zero)
+            $null = [OichaScrollProbe]::SendMessageW($handle,0x0101,[IntPtr]$case.key,[IntPtr]::Zero)
+            Start-Sleep -Milliseconds 200
+            $after = Read-Probe
+            $trace.Add(@{case=$case.name;before=$before;after=$after})
+            if ($after.y -ge $before.y -or [Math]::Abs($after.x-$before.x) -gt 12) {
+                $failures.Add("$($case.name): $($before.cursor) ($($before.x),$($before.y)) -> $($after.cursor) ($($after.x),$($after.y))")
+            }
+        }
+        foreach ($mode in @('vim','novim')) {
+            Send-Command $mode
+            Send-Command wide
+            Start-Sleep -Milliseconds 200
+            $before = Read-Probe
+            foreach ($key in @(40,40,38,38)) {
+                $null = [OichaScrollProbe]::SendMessageW($handle,0x0100,[IntPtr]$key,[IntPtr]::Zero)
+                $null = [OichaScrollProbe]::SendMessageW($handle,0x0101,[IntPtr]$key,[IntPtr]::Zero)
+                Start-Sleep -Milliseconds 100
+            }
+            $after = Read-Probe
+            $trace.Add(@{case=('short-row-roundtrip-'+$mode);before=$before;after=$after})
+            if ([Math]::Abs($before.x-$after.x) -gt 12 -or $before.y -ne $after.y) { $failures.Add("Horizontal column was lost across the shorter row ($mode)") }
+        }
+        if ((Read-Probe).generation -ne $generation) { $failures.Add('Cursor movement modified manuscript content') }
+        @{result=$(if ($failures.Count) {'FAIL'} else {'PASS'}); errors=@($failures); cases=@($trace)} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $root 'cursor-results.json') -Encoding utf8NoBOM
+        if ($failures.Count -and !$ExpectFailure) { throw ($failures | Out-String) }
+        Write-Output "Cursor probe: $($failures.Count) failures; $root"
+        return
+    }
     Send-Command partial
     Start-Sleep -Milliseconds 50
     Send-Command first

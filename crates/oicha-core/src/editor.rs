@@ -365,6 +365,16 @@ impl Editor {
             .position(|r| r.range.contains(&p) || r.range.is_empty() && r.range.start == p)
             .or_else(|| self.display_rows.iter().rposition(|r| r.range.end == p))
     }
+    /// GUI arrows use the current horizontal position rather than Vim's
+    /// persistent end-of-line goal. Keep a finite preferred x across short rows.
+    pub fn use_finite_vertical_column(&mut self) {
+        if self.prefer_end {
+            self.prefer_end = false;
+            self.preferred_x = None;
+            self.preferred_column = None;
+        }
+    }
+
     pub fn display_vertical(&mut self, delta: isize, select: bool) {
         let Some(index) = self.display_row_index(self.cursor) else {
             self.vertical(delta, select);
@@ -1883,6 +1893,44 @@ mod tests {
         e.display_vertical(1, true);
         assert!(e.selection().is_empty());
         assert_eq!(e.cursor, 11);
+    }
+    #[test]
+    fn gui_arrows_after_end_use_a_finite_column_and_restore_it_after_short_rows() {
+        let mut e = editor("abcdef\nabc\nabcdef");
+        e.set_display_rows(
+            [0..6, 7..10, 11..17]
+                .into_iter()
+                .map(|range| {
+                    let stops = (range.start..=range.end)
+                        .map(|i| (i, (i - range.start) as f32 * 10.))
+                        .collect();
+                    DisplayRow { range, stops }
+                })
+                .collect(),
+        );
+        e.move_to(8, false);
+        keys(&mut e, &["end"]);
+        assert_eq!(e.cursor, 9);
+        e.use_finite_vertical_column();
+        keys(&mut e, &["up"]);
+        assert_eq!(e.cursor, 2, "Arrow Up stuck to the longer row's end");
+        e.use_finite_vertical_column();
+        keys(&mut e, &["down"]);
+        assert_eq!(e.cursor, 9);
+        e.move_to(4, false);
+        for expected in [9, 15] {
+            e.use_finite_vertical_column();
+            keys(&mut e, &["down"]);
+            assert_eq!(e.cursor, expected);
+        }
+        // Explicit Vim motions still honor their end-of-line goal.
+        e.move_to(8, false);
+        keys(&mut e, &["$", "k"]);
+        assert_eq!(e.cursor, 5);
+        // Switching from a Vim end-goal to arrows uses the position now shown.
+        e.use_finite_vertical_column();
+        keys(&mut e, &["down", "down"]);
+        assert_eq!(e.cursor, 16);
     }
     #[test]
     fn append_targets_current_display_row_and_is_one_undo_group() {

@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "oicha"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "directories",
@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "oicha-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "oicha-update"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
