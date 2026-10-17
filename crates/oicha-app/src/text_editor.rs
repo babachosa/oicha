@@ -24,6 +24,7 @@ pub enum EditorEvent {
     Submit,
     Cancel,
     FindNext(bool),
+    ClipboardUnavailable,
 }
 
 #[derive(Clone)]
@@ -447,6 +448,21 @@ impl TextEditor {
         )
     }
 
+    /// QA must wait for the frame applying the last scroll offset, not just
+    /// the animation's clock. ScrollHandle child bounds exclude its offset.
+    pub fn motion_geometry_settled(&self) -> bool {
+        !self.autoscroll
+            && !self.center_cursor
+            && !self.advance_page
+            && !self.motion_probe().3
+            && self
+                .bounds
+                .zip(self.scroll.bounds_for_item(0))
+                .is_some_and(|(painted, paper)| {
+                    (painted.top() - paper.top() - self.scroll.offset().y).abs() < px(0.5)
+                })
+    }
+
     pub fn format(&mut self, flag: char, window: &mut Window, cx: &mut Context<Self>) {
         let old = self.engine.generation;
         self.engine.finish_group();
@@ -471,12 +487,30 @@ impl TextEditor {
         self.changed(old, cx);
     }
 
-    fn copy(&self, cx: &mut Context<Self>) {
+    fn copy(&self, cx: &mut Context<Self>) -> bool {
         let selection = self.engine.painted_selection();
         if !selection.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.engine.body.text[selection].into(),
-            ));
+            let text = &self.engine.body.text[selection];
+            cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
+            // GPUI's clipboard setter has no error result. Windows can refuse
+            // access while another application owns it; never Cut in that case.
+            if cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref()
+                != Some(text)
+            {
+                cx.emit(EditorEvent::ClipboardUnavailable);
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn cut_if_copied(&mut self, copied: bool) {
+        if copied {
+            self.engine.finish_group();
+            self.engine.replace(self.engine.painted_selection(), "");
         }
     }
 
@@ -542,11 +576,12 @@ impl TextEditor {
             }
             match key {
                 "a" => self.engine.select_all(),
-                "c" => self.copy(cx),
-                "x" => {
+                "c" => {
                     self.copy(cx);
-                    self.engine.finish_group();
-                    self.engine.replace(self.engine.painted_selection(), "");
+                }
+                "x" => {
+                    let copied = self.copy(cx);
+                    self.cut_if_copied(copied);
                 }
                 "v" => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
@@ -558,6 +593,8 @@ impl TextEditor {
                             text.replace(['\r', '\n'], " ")
                         });
                         self.engine.finish_group();
+                    } else {
+                        cx.emit(EditorEvent::ClipboardUnavailable);
                     }
                 }
                 "z" if stroke.modifiers.shift => self.replay_history(true),
@@ -587,6 +624,10 @@ impl TextEditor {
                 self.engine.escape();
                 self.marked = None;
             }
+        } else if matches!(key, "home" | "end") && self.engine.pending().is_empty() {
+            self.engine.finish_group();
+            self.engine
+                .display_boundary(key == "end", stroke.modifiers.shift);
         } else if self.engine.vim && self.engine.mode != Mode::Insert {
             let command = stroke.key_char.as_deref().unwrap_or(key);
             if matches!(command, "n" | "N") && self.engine.pending().is_empty() {
@@ -645,7 +686,7 @@ impl TextEditor {
                         self.input_clock.elapsed(),
                     );
                 }
-                "left" | "right" | "home" | "end" => {
+                "left" | "right" => {
                     self.engine.finish_group();
                     let p = match key {
                         "left" => {
@@ -655,15 +696,13 @@ impl TextEditor {
                                 self.engine.previous(self.engine.cursor)
                             }
                         }
-                        "right" => {
+                        _ => {
                             if !stroke.modifiers.shift && !self.engine.selection().is_empty() {
                                 self.engine.selection().end
                             } else {
                                 self.engine.next(self.engine.cursor)
                             }
                         }
-                        "home" => self.engine.line_start(self.engine.cursor),
-                        _ => self.engine.line_end(self.engine.cursor),
                     };
                     self.engine.move_to(p, stroke.modifiers.shift);
                 }

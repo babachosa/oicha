@@ -13,7 +13,7 @@ unicode-segmentation = "1.12"
 tempfile = "3"
 blake3 = { version = "1", features = ["pure"] }
 fs2 = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 grid = { version = "=0.18.0", default-features = false }

@@ -10,16 +10,25 @@ foreach ($scenario in @('load-success', 'load-failure')) {
     $manuscript = Join-Path $OutputDirectory ($scenario + '.oicha')
     $arguments = @('--smoke-test', ('"' + $manuscript + '"'))
     if ($scenario -eq 'load-failure') { $arguments += '--close-load-error' }
+    $report = [IO.Path]::ChangeExtension($manuscript, 'smoke-result.txt')
+    $closed = [IO.Path]::ChangeExtension($manuscript, 'smoke-closed.txt')
     # GPUI reflow tests need visible native frames; Windows suspends painting of
     # a hidden window. This is an interactive renderer test, not a background service.
     $process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Normal -RedirectStandardError (Join-Path $OutputDirectory ($scenario + '.stderr.txt'))
-    if (!$process.WaitForExit(120000)) {
-        $null = $process.CloseMainWindow()
-        throw "Native scenario $scenario timed out. Test manuscript preserved; process was not force-killed."
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    while (!$process.WaitForExit(250)) {
+        if ((Test-Path -LiteralPath $report) -and (Get-Content -LiteralPath $report -Raw) -match '^FAIL:') {
+            $failure = Get-Content -LiteralPath $report -Raw
+            $null = $process.CloseMainWindow()
+            $null = $process.WaitForExit(10000)
+            throw "Native scenario $scenario reported $failure. Test manuscript preserved."
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $null = $process.CloseMainWindow()
+            throw "Native scenario $scenario timed out. Test manuscript preserved; process was not force-killed."
+        }
     }
     $process.Refresh()
-    $report = [IO.Path]::ChangeExtension($manuscript, 'smoke-result.txt')
-    $closed = [IO.Path]::ChangeExtension($manuscript, 'smoke-closed.txt')
     if ($process.ExitCode -ne 0 -or !(Test-Path -LiteralPath $report) -or !(Test-Path -LiteralPath $closed)) { throw "Native scenario $scenario failed or queued close did not complete. See $OutputDirectory." }
     if ((Get-Content -LiteralPath $report -Raw) -notmatch '^PASS:' -or (Get-Content -LiteralPath $closed -Raw) -notmatch '^PASS:') { throw "Native scenario $scenario reported failure." }
     $oldBook = Get-Content -LiteralPath $manuscript -Raw | ConvertFrom-Json

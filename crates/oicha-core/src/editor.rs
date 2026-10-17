@@ -144,12 +144,19 @@ impl Editor {
     }
     fn restore(&mut self, s: Snapshot) {
         self.body = s.body;
-        self.cursor = s.cursor;
+        self.cursor = self.char_boundary(s.cursor);
         self.caret_affinity = CaretAffinity::Leading;
-        self.anchor = s.anchor;
+        self.anchor = self.char_boundary(s.anchor);
+        if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            self.mode = if self.vim { Mode::Normal } else { Mode::Insert };
+        }
         self.typing_style = self.body.style_at(self.cursor);
         self.display_rows.clear();
         self.clamp_normal();
+        self.visual_anchor = self.snap(self.cursor);
+        self.preferred_column = None;
+        self.preferred_x = None;
+        self.prefer_end = false;
         self.generation += 1;
         self.reset_pending();
     }
@@ -375,6 +382,41 @@ impl Editor {
         }
     }
 
+    /// Home/End use shaped rows; a soft-wrap endpoint stays on its original row.
+    pub fn display_boundary(&mut self, end: bool, select: bool) {
+        let (range, soft_end) = if let Some(index) = self.display_row_index(self.cursor) {
+            let range = self.display_rows[index].range.clone();
+            let soft_end = self
+                .display_rows
+                .get(index + 1)
+                .is_some_and(|next| next.range.start == range.end);
+            (range, soft_end)
+        } else {
+            (
+                self.line_start(self.cursor)..self.line_end(self.cursor),
+                false,
+            )
+        };
+        let visual = matches!(self.mode, Mode::Visual | Mode::VisualLine);
+        let target = if !end {
+            range.start
+        } else if self.vim && self.mode != Mode::Insert && (visual || !select) && !range.is_empty()
+        {
+            self.previous(range.end)
+        } else {
+            range.end
+        };
+        self.move_to(target, select || visual);
+        if end && soft_end && target == range.end {
+            self.caret_affinity = CaretAffinity::Trailing;
+        }
+        if visual {
+            self.update_visual();
+        } else if !select {
+            self.clamp_normal();
+        }
+    }
+
     pub fn display_vertical(&mut self, delta: isize, select: bool) {
         let Some(index) = self.display_row_index(self.cursor) else {
             self.vertical(delta, select);
@@ -422,6 +464,9 @@ impl Editor {
         }
     }
     pub fn select_all(&mut self) {
+        if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            self.mode = if self.vim { Mode::Normal } else { Mode::Insert };
+        }
         self.caret_affinity = CaretAffinity::Leading;
         self.anchor = 0;
         self.cursor = self.body.text.len();
@@ -469,11 +514,21 @@ impl Editor {
         self.preferred_x = None;
         self.prefer_end = false;
         self.display_rows.clear();
-        start..self.cursor
+        let inserted = start..self.cursor;
+        // GUI Cut/Paste can edit directly while Vim Visual is active. The
+        // previous Visual anchor belongs to the old body, not this revision.
+        if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            self.mode = if self.vim { Mode::Normal } else { Mode::Insert };
+            self.cursor = self.snap(self.cursor);
+            self.anchor = self.cursor;
+            self.clamp_normal();
+        }
+        self.visual_anchor = self.snap(self.cursor);
+        inserted
     }
     pub fn insert(&mut self, text: &str) {
         self.replace(
-            self.selection(),
+            self.painted_selection(),
             &text.replace("\r\n", "\n").replace('\r', "\n"),
         );
     }
@@ -662,11 +717,15 @@ impl Editor {
         start..end
     }
     fn visual_range(&self) -> Range<usize> {
+        // Defend rendering against stale byte offsets, including offsets that
+        // would split a Unicode grapheme after a body replacement.
+        let anchor = self.snap(self.visual_anchor);
+        let cursor = self.snap(self.cursor);
         if self.mode == Mode::VisualLine {
-            self.line_start(self.visual_anchor.min(self.cursor))
-                ..(self.line_end(self.visual_anchor.max(self.cursor)) + 1).min(self.body.text.len())
+            self.line_start(anchor.min(cursor))
+                ..(self.line_end(anchor.max(cursor)) + 1).min(self.body.text.len())
         } else {
-            self.visual_anchor.min(self.cursor)..self.next(self.visual_anchor.max(self.cursor))
+            anchor.min(cursor)..self.next(anchor.max(cursor))
         }
     }
     fn update_visual(&mut self) {
@@ -1352,6 +1411,149 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_history_restores_valid_state_through_empty_unicode_bodies() {
+        for visual in ["v", "V"] {
+            for backwards in [false, true] {
+                let mut e = editor("");
+                keys(&mut e, &["i"]);
+                e.insert("a\u{0301}🌿 đời");
+                e.escape();
+                let original = e.body.clone();
+                e.move_to(e.previous(e.body.text.len()), false);
+                keys(&mut e, &[visual]);
+                if backwards {
+                    keys(&mut e, &["h"]);
+                }
+                e.undo();
+                assert_eq!(e.body.text, "");
+                assert_eq!(e.mode, Mode::Normal);
+                assert_eq!(e.painted_selection(), 0..0);
+                e.redo();
+                assert_eq!(e.body, original);
+                assert_eq!(e.mode, Mode::Normal);
+                assert!(e.painted_selection().is_empty());
+                keys(&mut e, &[visual]);
+                e.undo();
+                // Redo itself is also safe when entered from a Visual selection.
+                keys(&mut e, &[visual]);
+                e.redo();
+                assert_eq!(e.body, original);
+                assert_eq!(e.mode, Mode::Normal);
+                assert!(e.painted_selection().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn gui_cut_paste_and_select_all_finish_visual_and_roundtrip_history() {
+        for visual in ["v", "V"] {
+            for backwards in [false, true] {
+                for paste in [false, true] {
+                    let mut e = editor("a\u{0301}🌿 đời");
+                    let original = e.body.clone();
+                    e.move_to(
+                        if backwards {
+                            e.previous(e.body.text.len())
+                        } else {
+                            0
+                        },
+                        false,
+                    );
+                    keys(&mut e, &[visual, if backwards { "h" } else { "l" }]);
+                    let selected = e.painted_selection();
+                    let value = if paste { "ấ🌱" } else { "" };
+                    let mut expected = original.text.clone();
+                    expected.replace_range(selected.clone(), value);
+                    e.finish_group();
+                    if paste {
+                        e.begin_group();
+                        e.insert(value);
+                        e.finish_group();
+                    } else {
+                        let inserted = e.replace_native(selected.clone(), value);
+                        assert_eq!(inserted, selected.start..selected.start);
+                    }
+                    assert_eq!(e.body.text, expected);
+                    assert_eq!(e.mode, Mode::Normal);
+                    assert!(e.painted_selection().is_empty());
+                    e.undo();
+                    assert_eq!(e.body, original);
+                    e.redo();
+                    assert_eq!(e.body.text, expected);
+                    e.body.validate().unwrap();
+                }
+                let mut e = editor("a\u{0301}🌿 đời");
+                keys(&mut e, &[visual]);
+                e.select_all();
+                assert_eq!(e.painted_selection(), 0..e.body.text.len());
+                e.replace(e.painted_selection(), "");
+                assert_eq!(e.painted_selection(), 0..0);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_visual_offsets_never_escape_utf8_or_grapheme_boundaries() {
+        let mut e = editor("a\u{0301}🌿");
+        for mode in [Mode::Visual, Mode::VisualLine] {
+            e.mode = mode;
+            for (anchor, cursor) in [(usize::MAX, usize::MAX), (2, 5), (5, 2)] {
+                e.visual_anchor = anchor;
+                e.cursor = cursor;
+                let range = e.painted_selection();
+                assert!(range.start <= range.end && range.end <= e.body.text.len());
+                assert_eq!(e.snap(range.start), range.start);
+                assert_eq!(e.snap(range.end), range.end);
+            }
+        }
+    }
+
+    #[test]
+    fn gui_home_end_use_display_rows_with_selection_and_soft_wrap_affinity() {
+        for mode in [Mode::Normal, Mode::Insert] {
+            for vim in [true, false] {
+                let mut e = wrapped_editor();
+                e.vim = vim;
+                e.mode = if vim { mode } else { Mode::Insert };
+                let original = e.body.clone();
+                e.move_to(4, false);
+                e.display_boundary(false, false);
+                assert_eq!(e.cursor, 3);
+                e.display_boundary(true, false);
+                assert_eq!(e.cursor, if vim && mode == Mode::Normal { 5 } else { 6 });
+                e.display_boundary(true, false);
+                e.display_boundary(false, false);
+                assert_eq!(e.cursor, 3, "End lost its row affinity");
+                e.move_to(1, false);
+                e.display_boundary(true, true);
+                assert_eq!(e.selection(), 1..3);
+                e.display_boundary(false, true);
+                assert_eq!(e.selection(), 0..1);
+                e.move_to(7, false);
+                e.display_boundary(true, false);
+                assert_eq!(e.cursor, if vim && mode == Mode::Normal { 7 } else { 8 });
+                assert_eq!(e.body, original);
+                assert_eq!(e.generation, 0);
+            }
+        }
+        let mut e = wrapped_editor();
+        e.move_to(1, false);
+        keys(&mut e, &["v"]);
+        e.display_boundary(true, false);
+        assert_eq!(e.painted_selection(), 1..3);
+        let mut e = editor("a\u{0301}🌿\n");
+        e.toggle_vim();
+        e.move_to(4, false);
+        e.display_boundary(false, false);
+        assert_eq!(e.cursor, 0);
+        e.display_boundary(true, true);
+        assert_eq!(e.selection(), 0.."a\u{0301}🌿".len());
+        e.move_to(e.body.text.len(), false);
+        e.display_boundary(true, false);
+        assert_eq!(e.cursor, e.body.text.len());
+    }
+
     #[test]
     fn zz_preserves_cursor_selection_history_and_cancels_invalid_prefixes() {
         use super::Effect;

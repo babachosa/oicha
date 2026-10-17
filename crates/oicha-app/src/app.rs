@@ -136,6 +136,31 @@ fn scratch() -> anyhow::Result<(Store, PathBuf)> {
     Ok((Store::create(path.clone())?, path))
 }
 
+async fn settle_editor(
+    editor: &Entity<TextEditor>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let mut stable = 0;
+    for _ in 0..80 {
+        cx.background_executor()
+            .timer(Duration::from_millis(25))
+            .await;
+        let settled = cx.update(|_, cx| {
+            let settled = editor.read(cx).motion_geometry_settled();
+            editor.update(cx, |_, cx| cx.notify());
+            settled
+        })?;
+        stable = if settled { stable + 1 } else { 0 };
+        if stable == 2 {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Editor motion/bounds did not settle: {}",
+        cx.update(|_, cx| editor.read(cx).scroll_diagnostics())?
+    )
+}
+
 impl Oicha {
     /// Isolated visual QA, available only under the explicit smoke-test flag.
     pub fn preview_popup(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -341,6 +366,94 @@ impl Oicha {
                 let dispatch = |key: &str, window: &mut Window, cx: &mut App| {
                     window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                 };
+                cx.update(|_, cx| editor.update(cx, |e, cx| {
+                    let generation = e.engine.generation + 1;
+                    e.engine = oicha_core::editor::Editor::new(RichText::plain("abcdef"));
+                    e.engine.generation = generation; e.engine.move_to(2, false);
+                    e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                }))?;
+                cx.update(|window, cx| { dispatch("d", window, cx); dispatch("end", window, cx); })?;
+                anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == "ab")?, "GUI End interrupted a pending Vim operator");
+                // Exercise the GUI history/clipboard routes, not only core Vim commands.
+                let clipboard = cx.update(|_, cx| cx.read_from_clipboard())?;
+                let visual_checks: anyhow::Result<()> = async {
+                    for visual in ["v", "V"] {
+                        for backwards in [false, true] {
+                            for action in ["ctrl-z", "ctrl-x", "ctrl-v", "toolbar-undo"] {
+                                cx.update(|_, cx| editor.update(cx, |e, cx| {
+                                    let generation = e.engine.generation + 1;
+                                    e.engine = oicha_core::editor::Editor::new(RichText::default());
+                                    e.engine.generation = generation;
+                                    e.engine.key("i"); e.engine.insert("a\u{0301}🌿 đời"); e.engine.escape();
+                                    e.engine.move_to(if backwards { e.engine.previous(e.engine.body.text.len()) } else { 0 }, false);
+                                    e.engine.key(visual); e.engine.key(if backwards { "h" } else { "l" });
+                                    let before = (e.engine.body.clone(), e.engine.painted_selection(), e.engine.generation);
+                                    e.cut_if_copied(false);
+                                    assert_eq!((e.engine.body.clone(), e.engine.painted_selection(), e.engine.generation), before, "Failed clipboard copy must not cut text");
+                                    cx.notify(); cx.emit(EditorEvent::Changed);
+                                }))?;
+                                let (body, range) = cx.update(|_, cx| { let e = editor.read(cx); (e.engine.body.clone(), e.engine.painted_selection()) })?;
+                                let mut expected = body.text.clone();
+                                match action {
+                                    "ctrl-z" | "toolbar-undo" => expected.clear(),
+                                    "ctrl-x" => { expected.replace_range(range, ""); },
+                                    _ => { expected.replace_range(range, "ấ🌱"); }
+                                }
+                                for _ in 0..20 {
+                                    if action == "ctrl-v" {
+                                        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("ấ🌱".into())))?;
+                                        cx.background_executor().timer(Duration::from_millis(25)).await;
+                                        if !cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()).as_deref() == Some("ấ🌱"))? { continue; }
+                                    }
+                                    if action == "toolbar-undo" {
+                                        this.update(cx, |this, cx| this.history(false, cx))?;
+                                    } else { cx.update(|window, cx| dispatch(action, window, cx))?; }
+                                    cx.background_executor().timer(Duration::from_millis(30)).await;
+                                    let text = cx.update(|_, cx| editor.read(cx).engine.body.text.clone())?;
+                                    if text == expected || text != body.text || !matches!(action, "ctrl-v" | "ctrl-x") { break; }
+                                    // Windows clipboard access can be temporarily locked. Retry
+                                    // only a no-op; never repeat an edit that changed the body.
+                                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                                }
+                                anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.body.text == expected && e.engine.mode == oicha_core::editor::Mode::Normal && e.engine.painted_selection().is_empty() })?, "Visual GUI action failed: {visual}/{backwards}/{action}");
+                                if action != "ctrl-z" && action != "toolbar-undo" {
+                                    cx.update(|window, cx| dispatch("ctrl-z", window, cx))?;
+                                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body == body)?, "Undo did not restore Visual clipboard edit");
+                                    cx.update(|window, cx| dispatch("ctrl-shift-z", window, cx))?;
+                                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == expected)?, "Redo did not restore Visual clipboard edit");
+                                } else {
+                                    cx.update(|window, cx| dispatch("ctrl-shift-z", window, cx))?;
+                                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body == body)?, "Redo after Visual history did not restore the text");
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }.await;
+                cx.update(|_, cx| cx.write_to_clipboard(clipboard.unwrap_or_else(|| ClipboardItem::new_string(String::new()))))?;
+                visual_checks?;
+                this.update(cx, |this, _| this.notice = None)?;
+                for vim in [true, false] {
+                    cx.update(|_, cx| editor.update(cx, |e, cx| {
+                        let generation = e.engine.generation + 1;
+                        e.engine = oicha_core::editor::Editor::new(RichText::plain("0123456789 ".repeat(30)));
+                        e.engine.generation = generation;
+                        if vim { e.engine.key("i"); } else { e.engine.toggle_vim(); }
+                        e.engine.move_to(200, false); e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                    }))?;
+                    cx.update(|window, cx| dispatch("home", window, cx))?;
+                    let (home, y) = cx.update(|_, cx| { let e = editor.read(cx); (e.engine.cursor, e.cursor_screen_point().y) })?;
+                    anyhow::ensure!(home > 0 && home < 200, "Home left the displayed row (vim={vim})");
+                    cx.update(|window, cx| dispatch("shift-end", window, cx))?;
+                    let end = cx.update(|_, cx| editor.read(cx).engine.cursor)?;
+                    anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.selection() == (home..end) && e.cursor_screen_point().y == y })?, "Shift+End selected outside its display row");
+                    cx.update(|window, cx| dispatch("end", window, cx))?;
+                    cx.update(|window, cx| dispatch("end", window, cx))?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.cursor == end)?, "Repeated End crossed a soft wrap");
+                    cx.update(|window, cx| dispatch("shift-home", window, cx))?;
+                    anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.selection() == (home..end) && e.cursor_screen_point().y == y })?, "Shift+Home selected outside its display row");
+                }
+                atomic_write(&report.with_extension("visual-gui.json"), &serde_json::to_vec_pretty(&serde_json::json!({"result":"PASS","visualClipboardHistoryCases":16,"homeEndModes":["vim-insert","vim-off"],"shiftSelection":true,"repeatedEnd":true}))?)?;
                 for vim in [true, false] {
                     cx.update(|_, cx| editor.update(cx, |e, cx| {
                         let generation = e.engine.generation + 1;
@@ -433,7 +546,7 @@ impl Oicha {
                         e.engine.move_to(e.engine.body.text.len(), false);
                         e.font_size = 20.; e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
                     }))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let first_row = cx.update(|_, cx| editor.read(cx).cursor_screen_point().y)?;
                     let before_pages = cx.update(|_, cx| editor.read(cx).page_metrics())?;
                     let mut wrapped = false;
@@ -445,7 +558,7 @@ impl Oicha {
                         }
                     }
                     anyhow::ensure!(wrapped, "Soft wrap fixture did not reach the next display row");
-                    cx.background_executor().timer(Duration::from_millis(160)).await;
+                    settle_editor(&editor, cx).await?;
                     let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                     anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "Soft wrap did not open the same writing area as Enter (vim={vim}): {middle:?}/{height:?}");
                     let after_pages = cx.update(|_, cx| editor.read(cx).page_metrics())?;
@@ -471,7 +584,7 @@ impl Oicha {
                             let e = editor.read(cx); (e.scroll.offset().y, e.motion_probe().2, e.motion_probe().3)
                         })?;
                         anyhow::ensure!(active && current > before && current < target, "Wheel did not produce intermediate animation frames: {before:?}/{current:?}/{target:?}");
-                        cx.background_executor().timer(Duration::from_millis(160)).await;
+                        settle_editor(&editor, cx).await?;
                         anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.scroll.offset().y == target && !e.motion_probe().3 })?, "Wheel animation did not settle");
                         cx.update(|window, cx| {
                             let position = editor.read(cx).scroll.bounds().center();
@@ -493,13 +606,13 @@ impl Oicha {
                             });
                         })?;
                         let interrupted = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
-                        cx.background_executor().timer(Duration::from_millis(160)).await;
+                        settle_editor(&editor, cx).await?;
                         anyhow::ensure!(cx.update(|_, cx| editor.read(cx).scroll.offset())? == interrupted, "Touchpad input was overridden by pending wheel motion");
                         cx.update(|window, cx| editor.update(cx, |e, cx| e.replace_text_in_range(None, "W", window, cx)))?;
                         cx.background_executor().timer(Duration::from_millis(30)).await;
                         let (visual, logical, _, active) = cx.update(|_, cx| editor.read(cx).motion_probe())?;
                         anyhow::ensure!(active && visual.x < logical.x && visual.y == logical.y, "Typing caret did not glide toward the immediate logical caret: {visual:?}/{logical:?}");
-                        cx.background_executor().timer(Duration::from_millis(160)).await;
+                        settle_editor(&editor, cx).await?;
                         let (visual, logical, _, active) = cx.update(|_, cx| editor.read(cx).motion_probe())?;
                         anyhow::ensure!(visual == logical && !active, "Typing motion continued after settling");
                     }
@@ -511,7 +624,7 @@ impl Oicha {
                         e.engine.move_to(e.engine.body.text.len(), false);
                         e.font_size = 20.; e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
                     }))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                     anyhow::ensure!(middle > height * 0.65, "EOF fixture was not in the lower writing area");
                     cx.update(|window, cx| dispatch("enter", window, cx))?;
@@ -519,14 +632,14 @@ impl Oicha {
                     // scroll request before the next native frame.
                     cx.update(|window, cx| editor.update(cx, |e, cx| e.replace_and_mark_text_in_range(None, "đ", Some(1..1), window, cx)))?;
                     cx.update(|window, cx| editor.update(cx, |e, cx| e.replace_text_in_range(None, "đ", window, cx)))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                     anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "EOF Enter did not open a fresh writing area (vim={vim}): {middle:?}/{height:?}");
                     anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == format!("{page_text}\nđ"))?, "Auto page scrolling inserted extra document text");
                     let offset = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
                     let row_before = cx.update(|_, cx| editor.read(cx).cursor_screen_point().y)?;
                     cx.update(|window, cx| dispatch("enter", window, cx))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let after = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
                     let row_after = cx.update(|_, cx| editor.read(cx).cursor_screen_point().y)?;
                     if middle + row_after - row_before >= height * 0.65 {
@@ -544,19 +657,19 @@ impl Oicha {
                         e.engine.move_to(e.engine.body.text.find("\n").unwrap(), false);
                         e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
                     }))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let offset = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
                     cx.update(|window, cx| dispatch("enter", window, cx))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     anyhow::ensure!(cx.update(|_, cx| editor.read(cx).scroll.offset())? == offset, "Enter in existing text triggered an EOF page jump");
                     cx.update(|_, cx| editor.update(cx, |e, cx| {
                         let middle = e.engine.body.text.match_indices('\n').nth(40).unwrap().0;
                         e.engine.move_to(middle, false);
                         e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
                     }))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     cx.update(|window, cx| dispatch("enter", window, cx))?;
-                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    settle_editor(&editor, cx).await?;
                     let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                     anyhow::ensure!(middle > height * 0.65, "Enter inside existing text incorrectly opened a new writing area");
                 }
@@ -589,7 +702,7 @@ impl Oicha {
                 cx.update(|window, cx| dispatch("escape", window, cx))?;
                 cx.update(|window, cx| dispatch("u", window, cx))?;
                 anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body == before_append)?, "Undo after A failed to restore wrapped text");
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (previous, next, gap) = cx.update(|_, cx| editor.read(cx).page_boundary_probe().expect("multi-page fixture"))?;
                 cx.update(|_, cx| editor.update(cx, |e, cx| { e.engine.move_to(previous, false); e.reveal_cursor(cx); }))?;
                 let before_gap = cx.update(|_, cx| editor.read(cx).cursor_screen_point().y)?;
@@ -618,7 +731,7 @@ impl Oicha {
                 anyhow::ensure!(cx.update(|_, cx| editor.read(cx).cursor_screen_point())? == gpui::point(px(0.), zero_point.y + height), "j after 0 retained the old horizontal position");
                 // Exercise the same mapping after the font changes and wrapping is recalculated.
                 cx.update(|_, cx| editor.update(cx, |e, cx| { e.font_size = 28.; cx.notify(); }))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let point = cx.update(|_, cx| editor.read(cx).cursor_screen_point())?;
                 cx.update(|window, cx| dispatch("j", window, cx))?;
                 anyhow::ensure!(cx.update(|_, cx| editor.read(cx).cursor_screen_point().y)? == point.y + px(28. * 1.85), "j used stale wrapping after font change");
@@ -633,11 +746,11 @@ impl Oicha {
                 })?;
                 cx.update(|window, cx| dispatch("z", window, cx))?;
                 cx.update(|window, cx| dispatch("z", window, cx))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                 anyhow::ensure!((f32::from(middle - height / 2.)).abs() < 2., "zz did not center the final display row: {middle:?}/{height:?}; {}", cx.update(|_, cx| editor.read(cx).scroll_diagnostics())?);
                 cx.update(|_, cx| editor.update(cx, |e, cx| { e.scroll.scroll_to_bottom(); cx.notify(); }))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                 anyhow::ensure!(middle < height * 0.4, "No scroll space below the last row: {middle:?}/{height:?}");
                 let bottom_offset = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
@@ -645,7 +758,7 @@ impl Oicha {
                 cx.background_executor().timer(Duration::from_millis(80)).await;
                 anyhow::ensure!(cx.update(|_, cx| editor.read(cx).scroll.offset())? == bottom_offset, "First z scrolled before the command completed");
                 cx.update(|window, cx| dispatch("z", window, cx))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                 anyhow::ensure!((f32::from(middle - height / 2.)).abs() < 2., "zz did not return from the bottom scroll space");
                 anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); (e.engine.body.clone(), e.engine.cursor, e.engine.generation) })? == before_center, "zz or end spacing changed manuscript content/cursor/history");
@@ -653,7 +766,7 @@ impl Oicha {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
                 cx.update(|window, cx| dispatch("z", window, cx))?;
                 cx.update(|window, cx| dispatch("z", window, cx))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                 anyhow::ensure!((f32::from(middle - height / 2.)).abs() < 2., "zz did not center after resizing: {middle:?}/{height:?}");
                 let tail = cx.update(|_, cx| editor.read(cx).scroll.bounds_for_item(1).unwrap().size.height)?;
@@ -663,18 +776,32 @@ impl Oicha {
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
                     e.engine.key("A"); e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
                 }))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 cx.update(|window, cx| dispatch("enter", window, cx))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
                 anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "EOF Enter failed in a small viewport with large text");
                 cx.update(|window, cx| dispatch("escape", window, cx))?;
                 cx.update(|_, cx| editor.update(cx, |e, cx| { e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx); }))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 cx.update(|window, cx| dispatch("o", window, cx))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                // A 120ms animation can start a frame after key dispatch, and
+                // Windows may delay the frame applying its final bounds. Keep
+                // the exact geometry assertion, with a bounded frame wait.
+                let started = Instant::now();
+                let mut samples = vec![];
+                for _ in 0..40 {
+                    cx.background_executor().timer(Duration::from_millis(25)).await;
+                    let (middle, height, active) = cx.update(|_, cx| {
+                        let e = editor.read(cx); let (middle, height) = e.cursor_viewport_geometry();
+                        (f32::from(middle), f32::from(height), e.motion_probe().3)
+                    })?;
+                    samples.push((started.elapsed().as_millis() as u64, middle, height, active));
+                    if (middle - height * 0.32).abs() < 2. && !active { break; }
+                }
+                atomic_write(&report.with_extension("vim-o-motion.json"), &serde_json::to_vec_pretty(&samples)?)?;
                 let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
-                anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "Vim o at EOF did not open the same writing area");
+                anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "Vim o at EOF did not open the same writing area: {middle:?}/{height:?}; {}", cx.update(|_, cx| editor.read(cx).scroll_diagnostics())?);
                 cx.update(|window, _| window.resize(size(px(1440.), px(940.))))?;
                 cx.background_executor().timer(Duration::from_millis(200)).await;
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
@@ -682,7 +809,7 @@ impl Oicha {
                     e.engine = oicha_core::editor::Editor::new(original.clone());
                     e.engine.generation = generation; e.font_size = 20.; e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
                 }))?;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                settle_editor(&editor, cx).await?;
                 cx.update(|window, cx| dispatch("i", window, cx))?;
                 anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.mode == oicha_core::editor::Mode::Insert)?, "Vim i did not enter Insert through native event dispatch");
                 cx.update(|window, cx| dispatch("ấ", window, cx))?;
@@ -985,6 +1112,7 @@ impl Oicha {
                         EditorEvent::Command => this.show_prompt(PromptKind::Command, window, cx),
                         EditorEvent::Search => this.show_prompt(PromptKind::Search, window, cx),
                         EditorEvent::FindNext(back) => this.find_next(*back, cx),
+                        EditorEvent::ClipboardUnavailable => this.clipboard_unavailable(cx),
                         _ => {}
                     }
                     cx.notify();
@@ -1000,6 +1128,13 @@ impl Oicha {
         let language = self.language;
         self.book.revision += 1;
         self.status = language.text("Có thay đổi chưa lưu").into();
+        cx.notify();
+    }
+    fn clipboard_unavailable(&mut self, cx: &mut Context<Self>) {
+        self.notice = Some(self.language.choose(
+            "Chưa truy cập được bảng nhớ tạm. Nội dung chưa bị cắt; hãy thử lại thao tác sao chép/cắt/dán.",
+            "The clipboard is unavailable. No text was cut; please retry copy/cut/paste.",
+        ).into());
         cx.notify();
     }
     fn activate_chapter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1577,6 +1712,7 @@ impl Oicha {
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 EditorEvent::Submit => this.submit_prompt(window, cx),
                 EditorEvent::Cancel => this.cancel_prompt(window, cx),
+                EditorEvent::ClipboardUnavailable => this.clipboard_unavailable(cx),
                 _ => {}
             });
         self.prompt = Some(Prompt {
@@ -1767,6 +1903,7 @@ impl Oicha {
                     EditorEvent::Command => this.show_prompt(PromptKind::Command, window, cx),
                     EditorEvent::Search => this.show_prompt(PromptKind::Search, window, cx),
                     EditorEvent::FindNext(back) => this.find_next(*back, cx),
+                    EditorEvent::ClipboardUnavailable => this.clipboard_unavailable(cx),
                     _ => {}
                 }
                 cx.notify();

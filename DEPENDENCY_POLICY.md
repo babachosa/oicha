@@ -3,6 +3,12 @@
 The application and editor remain Rust/GPUI. The PowerShell scripts are build
 and QA tools; the desktop runtime does not execute them.
 
+Oicha 0.2.4 upgrades the DOCX writer's `zip` dependency from 4.6.1 to 9.0.4.
+This removes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369 from
+the locked graph. These extraction advisories have not been added to any
+exception list. DOCX writing and native export regressions must pass after the
+upgrade; the runtime still does not import or extract ZIP archives.
+
 CI queries OSV for every registry package/version in Cargo.lock. Incomplete
 responses, pagination that was not consumed, network failure after retries and
 unreviewed advisory IDs fail the check. Passing this check covers published
