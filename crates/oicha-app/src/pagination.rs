@@ -1,7 +1,7 @@
 //! Display pagination only. Page boundaries never insert manuscript characters.
 pub const MARGIN: f32 = 76.;
 pub const FIRST_TEXT_TOP: f32 = MARGIN;
-pub const PAGE_GAP: f32 = 24.;
+pub const PAGE_GAP: f32 = 12.;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageGeometry {

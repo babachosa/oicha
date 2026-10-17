@@ -207,6 +207,16 @@ impl Oicha {
                                             e.reveal_cursor(cx);
                                             cx.emit(EditorEvent::Changed);
                                         }
+                                        "input-fixture" => {
+                                            let generation = e.engine.generation + 1;
+                                            e.engine = oicha_core::editor::Editor::new(RichText::plain(value["text"].as_str().unwrap_or("")));
+                                            e.engine.generation = generation;
+                                            if value["vim"] == false { e.engine.toggle_vim(); }
+                                            if value["insert"] == true && e.engine.mode != oicha_core::editor::Mode::Insert { e.engine.key("i"); }
+                                            e.engine.move_to(value["cursor"].as_u64().unwrap_or(0) as usize, false);
+                                            e.reveal_cursor(cx);
+                                            cx.emit(EditorEvent::Changed);
+                                        }
                                         "novim" => { if e.engine.vim { e.engine.toggle_vim(); } }
                                         "vim" => { if !e.engine.vim { e.engine.toggle_vim(); } e.engine.escape(); }
                                         "pixels-top" | "pixels-bottom" => {
@@ -225,7 +235,7 @@ impl Oicha {
                             let (_, _, target, active) = e.motion_probe();
                             let bounds = e.scroll.bounds();
                             let point = e.cursor_screen_point();
-                            let value = serde_json::json!({"command": last, "offset": f32::from(e.scroll.offset().y), "target": f32::from(target), "active": active, "max": f32::from(e.scroll.max_offset().height), "caret": f32::from(middle), "height": f32::from(height), "viewport": [f32::from(bounds.left()), f32::from(bounds.top()), f32::from(bounds.size.width), f32::from(bounds.size.height)], "generation": e.engine.generation, "cursor": e.engine.cursor, "anchor": e.engine.anchor, "x": f32::from(point.x), "y": f32::from(point.y)});
+                            let value = serde_json::json!({"command": last, "offset": f32::from(e.scroll.offset().y), "target": f32::from(target), "active": active, "max": f32::from(e.scroll.max_offset().height), "caret": f32::from(middle), "height": f32::from(height), "viewport": [f32::from(bounds.left()), f32::from(bounds.top()), f32::from(bounds.size.width), f32::from(bounds.size.height)], "generation": e.engine.generation, "cursor": e.engine.cursor, "anchor": e.engine.anchor, "mode": format!("{:?}", e.engine.mode), "text": e.engine.body.text, "x": f32::from(point.x), "y": f32::from(point.y)});
                             let _ = atomic_write(&path, &serde_json::to_vec(&value).unwrap());
                             let _ = window;
                         }).is_err() { break; }
@@ -534,8 +544,8 @@ impl Oicha {
                     cx.update(|window, cx| dispatch("u", window, cx))?;
                     anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == "Mot doan co dinh.\nHang tiep theo.")?, "Vietnamese composition undo lost the original text");
                 }
-                // EOF paragraph breaks open a fresh writing area, with Vim ON
-                // and OFF. Early/middle breaks and IME stay in their viewport.
+                // Row advances open a fresh writing area with Vim ON and OFF,
+                // both at EOF and while inserting into existing paragraphs.
                 let page_text = "Một hàng để viết tiếp câu chuyện.\n".repeat(70) + "Hàng cuối";
                 for vim in [true, false] {
                     cx.update(|_, cx| editor.update(cx, |e, cx| {
@@ -671,7 +681,35 @@ impl Oicha {
                     cx.update(|window, cx| dispatch("enter", window, cx))?;
                     settle_editor(&editor, cx).await?;
                     let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
-                    anyhow::ensure!(middle > height * 0.65, "Enter inside existing text incorrectly opened a new writing area");
+                    anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "Enter inside existing text did not open a fresh writing area (vim={vim}): {middle:?}/{height:?}");
+                    // Force a soft wrap inside a paragraph, with a suffix after
+                    // the caret. Feed a burst before paint to cover fast typing.
+                    cx.update(|_, cx| editor.update(cx, |e, cx| {
+                        let at = e.engine.body.text.match_indices('\n').nth(45).unwrap().0;
+                        e.engine.move_to(at, false);
+                        e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
+                    }))?;
+                    settle_editor(&editor, cx).await?;
+                    let before = cx.update(|_, cx| editor.read(cx).engine.body.text.clone())?;
+                    let at = cx.update(|_, cx| editor.read(cx).engine.cursor)?;
+                    let input = "mưa ".repeat(18);
+                    cx.update(|window, cx| editor.update(cx, |e, cx| {
+                        for word in input.split_inclusive(' ') { e.replace_text_in_range(None, word, window, cx); }
+                    }))?;
+                    settle_editor(&editor, cx).await?;
+                    let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
+                    anyhow::ensure!((f32::from(middle - height * 0.32)).abs() < 2., "Soft wrap inside existing text did not open a fresh writing area (vim={vim}): {middle:?}/{height:?}");
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == format!("{}{}{}", &before[..at], input, &before[at..]))?, "Writing-area scroll changed the paragraph suffix");
+                    cx.update(|_, cx| editor.update(cx, |e, cx| {
+                        let at = e.engine.body.text.match_indices('\n').nth(50).unwrap().0;
+                        e.engine.move_to(at, false);
+                        e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
+                    }))?;
+                    settle_editor(&editor, cx).await?;
+                    let offset = cx.update(|_, cx| editor.read(cx).scroll.offset())?;
+                    cx.update(|window, cx| { dispatch("enter", window, cx); dispatch("up", window, cx); })?;
+                    settle_editor(&editor, cx).await?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).scroll.offset())? == offset, "Navigation before paint retained a stale writing-area request (vim={vim}): before={offset:?}; {}", cx.update(|_, cx| editor.read(cx).scroll_diagnostics())?);
                 }
                 let wrapped = "Mùa gió thổi qua cửa sổ, trên con đường rất dài có những người vẫn đang bước đi. ".repeat(18);
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
@@ -771,10 +809,14 @@ impl Oicha {
                 anyhow::ensure!((f32::from(middle - height / 2.)).abs() < 2., "zz did not center after resizing: {middle:?}/{height:?}");
                 let tail = cx.update(|_, cx| editor.read(cx).scroll.bounds_for_item(1).unwrap().size.height)?;
                 anyhow::ensure!((f32::from(tail - height * 0.65)).abs() < 2., "End scroll space did not follow resized viewport: {tail:?}/{height:?}");
+                cx.update(|window, cx| { dispatch("2", window, cx); dispatch("z", window, cx); dispatch("z", window, cx); })?;
+                settle_editor(&editor, cx).await?;
+                let (middle, height) = cx.update(|_, cx| editor.read(cx).cursor_viewport_geometry())?;
+                anyhow::ensure!((f32::from(middle - height / 2.)).abs() < 2., "Counted zz lost its explicit center request when moving the caret");
                 // The fresh-writing-area behavior also fits a small viewport
                 // with large text, including Vim's o on the final logical line.
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
-                    e.engine.key("A"); e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
+                    e.engine.key("G"); e.engine.key("$"); e.engine.key("A"); e.scroll.set_offset(gpui::point(px(0.), px(0.))); e.reveal_cursor(cx);
                 }))?;
                 settle_editor(&editor, cx).await?;
                 cx.update(|window, cx| dispatch("enter", window, cx))?;
@@ -933,7 +975,7 @@ impl Oicha {
                 close_gate = Some(sender);
                 Ok(())
             }.await;
-            let output = match result { Ok(()) => "PASS: whole-word Vietnamese NFC/NFD wrapping across styles, custom-caption close during I/O, embedded Literata Vietnamese shaping in four styles at 16/20/28px without fallback, native UTF16 accent-only replacement/marked range/selection/undo, indexed glyph lookup and layout benchmark, input preserved during deterministic load barrier, queued close during load (completion requires smoke-closed.txt), word/idle undo with Vim ON/OFF, atomic Vietnamese IME, toolbar history, A/0/j/k/wrapping/font reflow, fixed A4 display pages, page-margin hit testing, j across page boundaries, soft-wrap writing area with Vim ON/OFF, intermediate and settled wheel/caret motion, precision-scroll cancellation, zz final-row centering and interrupted prefix, end scroll space and window resizing without document changes, EOF Enter fresh writing area with Vim ON/OFF and immediate IME, no repeat/inside-document jumps, newline undo and Vim o, Vietnamese baseline stability, formatting, search, modal focus/lifecycle/confirmation, background save, DOCX export.".to_owned(), Err(e) => format!("FAIL: {e:#}") };
+            let output = match result { Ok(()) => "PASS: whole-word Vietnamese NFC/NFD wrapping across styles, custom-caption close during I/O, embedded Literata Vietnamese shaping in four styles at 16/20/28px without fallback, native UTF16 accent-only replacement/marked range/selection/undo, indexed glyph lookup and layout benchmark, input preserved during deterministic load barrier, queued close during load (completion requires smoke-closed.txt), word/idle undo with Vim ON/OFF, atomic Vietnamese IME, toolbar history, A/0/j/k/wrapping/font reflow, fixed A4 display pages, page-margin hit testing, j across page boundaries, soft-wrap writing area with Vim ON/OFF, intermediate and settled wheel/caret motion, precision-scroll cancellation, zz final-row centering and interrupted prefix, end scroll space and window resizing without document changes, EOF Enter fresh writing area with Vim ON/OFF and immediate IME, middle-document Enter and burst soft-wrap writing area, stable same-row edits, newline undo and Vim o, Vietnamese baseline stability, formatting, search, modal focus/lifecycle/confirmation, background save, DOCX export.".to_owned(), Err(e) => format!("FAIL: {e:#}") };
             let _ = atomic_write(&report, output.as_bytes());
             let _ = this.update(cx, |this, cx| {
                 this.editors[this.active].update(cx, |e, cx| { e.scroll.set_offset(gpui::point(px(0.), px(0.))); cx.notify(); });
@@ -3593,15 +3635,9 @@ impl Render for Oicha {
                                 ),
                             )
                             .child(
-                                Self::button(
-                                    "save",
-                                    if self.saving {
-                                        language.text("Đang lưu…")
-                                    } else {
-                                        language.text("Lưu")
-                                    },
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                                Self::button("save", language.text("Lưu")).on_click(
+                                    cx.listener(|this, _, window, cx| this.save(window, cx)),
+                                ),
                             )
                             .child(
                                 Self::button("save-as", language.text("Lưu thành…")).on_click(

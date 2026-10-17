@@ -5,6 +5,7 @@
 
 mod app;
 mod fonts;
+mod input_context;
 mod motion;
 mod pagination;
 mod settings;
@@ -76,6 +77,7 @@ fn main() {
         return;
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let _vim_keyboard = input_context::install();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let smoke = args.first().is_some_and(|s| s == "--smoke-test");
     let path = if smoke {

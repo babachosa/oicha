@@ -283,7 +283,8 @@ impl TextEditor {
 
     pub fn new(body: RichText, compact: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
-        let blur = cx.on_blur(&focus, window, |this, _, cx| {
+        let blur = cx.on_blur(&focus, window, |this, window, cx| {
+            crate::input_context::set_mode(window, false);
             this.engine.finish_group();
             cx.notify();
         });
@@ -396,6 +397,7 @@ impl TextEditor {
         self.autoscroll = false;
         self.center_cursor = false;
         self.advance_page = false;
+        self.follow_edit = false;
         if self.compact {
             // Popup inputs retain GPUI's native scrolling.
             self.scroll_motion = None;
@@ -473,6 +475,10 @@ impl TextEditor {
 
     fn replay_history(&mut self, redo: bool) {
         self.advance_page = false;
+        self.follow_edit = false;
+        self.center_cursor = false;
+        self.scroll_motion = None;
+        self.scroll_written = None;
         self.marked = None;
         if redo {
             self.engine.redo();
@@ -515,6 +521,11 @@ impl TextEditor {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // This context-boundary key is also seen by external Vietnamese keyboard
+        // hooks. It must never become a Vim command or request a cursor reveal.
+        if event.keystroke.key == "f24" {
+            return;
+        }
         // Key events may arrive before the next paint after an edit; never use stale wrap positions.
         if let Some(bounds) = self.bounds {
             let layout = self.ensure_layout(self.text_width(bounds.size.width), window);
@@ -522,7 +533,19 @@ impl TextEditor {
         }
         let stroke = &event.keystroke;
         let old = self.engine.generation;
+        let old_cursor = self.engine.cursor;
+        let mut center_requested = false;
         let key = stroke.key.as_str();
+        let vim_command = self.engine.vim && self.engine.mode != Mode::Insert;
+        if matches!(key, "left" | "right" | "up" | "down" | "home" | "end") {
+            // An edit may still be waiting for paint when navigation arrives.
+            // Do not apply its writing-area request to the new caret position.
+            self.advance_page = false;
+            self.follow_edit = false;
+            self.center_cursor = false;
+            self.scroll_motion = None;
+            self.scroll_written = None;
+        }
         if matches!(key, "f1" | "f11") {
             return;
         }
@@ -633,9 +656,7 @@ impl TextEditor {
             if matches!(command, "n" | "N") && self.engine.pending().is_empty() {
                 cx.emit(EditorEvent::FindNext(command == "N"));
             } else {
-                let append_row = command == "o"
-                    && self.engine.mode == Mode::Normal
-                    && self.engine.line_end(self.engine.cursor) == self.engine.body.text.len();
+                let append_row = matches!(command, "o" | "O") && self.engine.mode == Mode::Normal;
                 match self.engine.key(command) {
                     Effect::Command => cx.emit(EditorEvent::Command),
                     Effect::Search => cx.emit(EditorEvent::Search),
@@ -643,7 +664,10 @@ impl TextEditor {
                         self.engine.register.text.clone(),
                     )),
                     Effect::None => {}
-                    Effect::CenterCursor => self.center_cursor = true,
+                    Effect::CenterCursor => {
+                        self.center_cursor = true;
+                        center_requested = true;
+                    }
                 }
                 self.advance_page |= append_row && self.engine.generation != old;
             }
@@ -654,9 +678,7 @@ impl TextEditor {
                     cx.emit(EditorEvent::Submit);
                 }
                 "enter" | "tab" if key == "enter" || !self.compact => {
-                    self.advance_page |= key == "enter"
-                        && !self.compact
-                        && self.engine.selection().end == self.engine.body.text.len();
+                    self.advance_page |= key == "enter" && !self.compact;
                     self.engine.edit_input(
                         self.engine.selection(),
                         if key == "enter" { "\n" } else { "    " },
@@ -715,6 +737,26 @@ impl TextEditor {
         }
         window.prevent_default();
         cx.stop_propagation();
+        if vim_command
+            && self.engine.generation == old
+            && self.engine.cursor != old_cursor
+            && !center_requested
+        {
+            self.advance_page = false;
+            self.follow_edit = false;
+            self.center_cursor = false;
+            self.scroll_motion = None;
+            self.scroll_written = None;
+        }
+        crate::input_context::set_mode(window, self.engine.vim && self.engine.mode != Mode::Insert);
+        if vim_command
+            && self.engine.mode == Mode::Insert
+            && !stroke.modifiers.control
+            && !stroke.modifiers.platform
+            && !stroke.modifiers.alt
+        {
+            crate::input_context::finish_vim_command(window);
+        }
         self.changed(old, cx);
         if self.engine.pending().starts_with('z') {
             // A prefix is not a completed scrolling command. Preserve a
@@ -1173,6 +1215,9 @@ impl TextEditor {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.advance_page = false;
+        self.follow_edit = false;
+        self.center_cursor = false;
         self.caret_motion = None;
         self.scroll_motion = None;
         self.scroll_written = None;
@@ -1286,8 +1331,7 @@ impl EntityInputHandler for TextEditor {
         } else {
             InputEditKind::Typing
         };
-        self.advance_page |=
-            !self.compact && text == "\n" && range.end == self.engine.body.text.len();
+        self.advance_page |= !self.compact && text.contains('\n');
         let flash = !self.compact
             && !committing
             && range.is_empty()
@@ -1298,9 +1342,7 @@ impl EntityInputHandler for TextEditor {
             .edit_input(range, &text, kind, self.input_clock.elapsed());
         self.input_flash = flash.then(|| (inserted, self.engine.generation, Instant::now()));
         self.marked = None;
-        self.follow_edit |= !self.compact
-            && self.engine.generation != old
-            && self.engine.cursor == self.engine.body.text.len();
+        self.follow_edit |= !self.compact && self.engine.generation != old;
         self.changed(old, cx);
     }
     fn replace_and_mark_text_in_range(
@@ -1333,9 +1375,7 @@ impl EntityInputHandler for TextEditor {
             self.engine.anchor = start + temporary.offset_from_utf16(selection.start);
             self.engine.cursor = start + temporary.offset_from_utf16(selection.end);
         }
-        self.follow_edit |= !self.compact
-            && self.engine.generation != old
-            && self.engine.cursor == self.engine.body.text.len();
+        self.follow_edit |= !self.compact && self.engine.generation != old;
         self.changed(old, cx);
     }
     fn bounds_for_range(
@@ -1476,7 +1516,6 @@ impl Element for ManuscriptElement {
                     // even if the first row's glyphs already fit in the viewport.
                     offset.y = px(0.);
                 } else if advance_page
-                    && e.engine.cursor == e.engine.body.text.len()
                     && caret + e.line_height() / 2. >= viewport.top() + viewport.size.height * 0.65
                 {
                     // Hard breaks and soft wraps share the writing-area rule.
@@ -1738,7 +1777,13 @@ impl Element for ManuscriptElement {
 }
 
 impl Render for TextEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus.is_focused(window) {
+            crate::input_context::set_mode(
+                window,
+                self.engine.vim && self.engine.mode != Mode::Insert,
+            );
+        }
         let paper = div()
             .when(self.compact, |d| {
                 d.w_full().min_h(px(30.)).bg(rgb(0xffffff))

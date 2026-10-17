@@ -51,6 +51,18 @@ fn supported_commands_match_vim_reference() {
         ("dl at end", "abc\ndef", 2, &["d", "l"]),
         ("dh at beginning", "abc\ndef", 4, &["d", "h"]),
         ("dw", "one two three", 0, &["d", "w"]),
+        (
+            "word after joining Vietnamese words",
+            "mưa nắng gió về",
+            "mưa".len(),
+            &["x", "w", "w"],
+        ),
+        (
+            "Vietnamese insert inside joined word",
+            "mưa nắng gió về",
+            "mưa ".len(),
+            &["d", "w", "i", "insert:hòa", "escape", "w"],
+        ),
         ("dw at line end", "one two\nthree", 4, &["d", "w"]),
         ("2dw", "one two three four", 0, &["2", "d", "w"]),
         ("d2w", "one two three four", 0, &["d", "2", "w"]),

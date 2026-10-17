@@ -3760,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "oicha"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "directories",
@@ -3770,15 +3770,17 @@ dependencies = [
  "log",
  "oicha-core",
  "oicha-update",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tempfile",
  "unicode-segmentation",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "oicha-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3793,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "oicha-update"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

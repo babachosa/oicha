@@ -1,18 +1,17 @@
-Oicha 0.2.4 resolves all three findings from the October 17 audit.
+Oicha 0.2.5 fixes Vietnamese input and Vim command interference on Windows.
 
-Undo, redo and clipboard edits now leave Vim Visual/Visual Line selection state
-valid, including Unicode text and undoing to an empty chapter. This fixes a crash
-when an old selection anchor pointed past the restored text. Visual paste replaces
-the complete visible selection.
-If Windows temporarily locks the clipboard, Cut now keeps the text and shows a
-retry notice instead of deleting text whose clipboard copy could not be verified.
+Normal/Visual commands now reach Vim before an external keyboard-hook input
+method can change or swallow them. Entering Insert starts a fresh input context,
+so Vietnamese Telex works after i/a/A/cw/dw and when inserting directly beside
+existing text. Repeated w commands jump on the first press after joining words.
+Input in Insert mode, Vim off, prompts and other applications uses the OS path.
 
-Home/End and Shift+Home/End follow the current displayed row, with Vim enabled or
-disabled. End stays on the same row at a soft wrap, including repeated presses.
-Existing Vim logical motions keep their documented behavior.
+Enter and soft wraps now open comfortable writing space near the bottom of the
+viewport both at EOF and while inserting into an existing paragraph. Rapid input
+and IME commits preserve the pending scroll request. Fixed page sizes are retained.
 
-The ZIP dependency used for DOCX export is upgraded from 4.6.1 to 9.0.4, removing
-the three ZIP extraction advisories reported by the audit. The dependency gate
-remains strict; no new advisory exception was added.
+The Save button keeps a stable label during autosave, preventing the toolbar
+from shifting. Saving progress remains in the status bar. The gap between sheets
+is reduced from 24 to 12 pixels.
 
 The Windows installer remains unsigned with Authenticode; update metadata is signed.

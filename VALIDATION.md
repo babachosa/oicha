@@ -2,7 +2,7 @@
 
 **Audit findings resolved in 0.2.4.** See [AUDIT_FIX_VALIDATION_2026-10-17.md](AUDIT_FIX_VALIDATION_2026-10-17.md) for final hashes, 62 passing tests, native regressions, dependency gate and the investigation of test timing/clipboard contention. The [original 0.2.3 review](AUDIT_REVIEW_2026-10-17.md) is historical.
 
-Latest candidate: **0.2.4**. [CURSOR_NAVIGATION_VALIDATION.md](CURSOR_NAVIGATION_VALIDATION.md) records the earlier 0.2.3 cursor fix. [SCROLL_EDGE_VALIDATION.md](SCROLL_EDGE_VALIDATION.md) records the actual signed 0.2.1 → 0.2.2 update test. Language/updater baseline evidence is in [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md). Earlier evidence below is historical.
+Latest candidate: **0.2.5**. See [VIM_IME_WRITING_VALIDATION_2026-10-17.md](VIM_IME_WRITING_VALIDATION_2026-10-17.md) for the UniKey/Vim input and writing-area fixes. [CURSOR_NAVIGATION_VALIDATION.md](CURSOR_NAVIGATION_VALIDATION.md) records the earlier 0.2.3 cursor fix. [SCROLL_EDGE_VALIDATION.md](SCROLL_EDGE_VALIDATION.md) records the actual signed 0.2.1 → 0.2.2 update test. Language/updater baseline evidence is in [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md). Earlier evidence below is historical.
 
 Windows x64, Rust 1.98.1 MSVC, GPUI 0.2.2. This records the candidate after fixing all six findings from the earlier production review and updating popup presentation/lifecycle, zz, end scroll space and Enter-at-EOF page advance, fixed A4 display pages, automatic soft-wrap follow, smooth typing/scroll motion, bundled Vietnamese Literata typography with clean page surfaces, whole-word Vietnamese wrapping and an integrated titlebar.
 
