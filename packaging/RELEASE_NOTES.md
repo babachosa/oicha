@@ -1,18 +1,18 @@
-Oicha 0.2.6 adds Vim character-find motions.
+Oicha 0.2.7 fixes intermittent language preference persistence on Windows.
 
-- Use f{character} to find the next occurrence on the current logical line,
-  or F{character} to search backward. Counts work, for example 2fa.
-- Press ; to repeat the last character search, or , to repeat in the opposite
-  direction without changing the remembered direction.
-- Combine these motions with Visual selection and d/c/y operators, including
-  counted commands such as d2fa and 2d2fa. Changes remain one undo transaction.
-- Vietnamese characters, combining marks and emoji retain safe cursor boundaries.
-  Target keys such as /, :, n and 0 remain literal characters during a find.
-- A failed or cancelled find never partially moves the cursor or edits text.
-  Searches stop at Enter and may cross soft wraps, matching Vim's logical lines.
-- The F1 shortcut guide includes these commands in Vietnamese and English.
+- Brief Windows access/sharing errors during atomic replacement of the settings
+  file are retried with bounded backoff. The previous file remains intact.
+- Preference reads also retry brief access/sharing errors rather than immediately
+  falling back to the default language.
+- A persistent settings-save failure keeps the previous language and displays an
+  error in Settings. It does not block manuscript autosave, and a successful retry
+  clears the settings error.
+- Native QA reports preference failures with diagnostic details instead of
+  aborting in a native callback assertion.
 
-Validated with 66 workspace tests, 104 differential cases against Vim, Clippy,
-and native Windows key dispatch and editor regression checks.
+The failure was reproduced with OS error 5 during repeated writes in OneDrive
+and with a controlled Windows file lock. Regression checks cover lock release,
+persistent lock preservation, temporary read locks and 2,000 preference changes.
+The Vim f/F, ; and , commands introduced in 0.2.6 are retained.
 
 The Windows installer remains unsigned with Authenticode; update metadata is signed.

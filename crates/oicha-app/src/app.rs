@@ -65,6 +65,7 @@ struct LoadedBook {
 pub struct Oicha {
     language: Language,
     settings: bool,
+    settings_error: Option<String>,
     update_status: UpdateStatus,
     update_available: Option<oicha_update::Available>,
     update_ready: Option<oicha_update::Prepared>,
@@ -335,22 +336,36 @@ impl Oicha {
             let mut close_gate = None;
             let result: anyhow::Result<()> = async {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                this.update_in(cx, |this, window, cx| {
+                this.update_in(cx, |this, window, cx| -> anyhow::Result<()> {
                     let original = this.book.clone();
                     let language = this.language;
                     this.set_language(Language::En, window, cx);
-                    assert_eq!(Preferences::load().language, Language::En);
+                    anyhow::ensure!(Preferences::load().language == Language::En, "English preference did not persist: {:?}", this.settings_error);
                     assert_eq!(this.editors[this.active].read(cx).language, Language::En);
                     this.show_prompt(PromptKind::Search, window, cx);
                     assert_eq!(this.prompt.as_ref().unwrap().title, "Find in chapter");
                     assert_eq!(this.prompt.as_ref().unwrap().input.read(cx).language, Language::En);
                     this.begin_modal();
+                    #[cfg(windows)]
+                    {
+                        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+                        let preferences_path = crate::settings::data_dir().join("preferences.json");
+                        let original_error = this.error.clone();
+                        let reader = OpenOptions::new().read(true).share_mode(1 | 2).open(preferences_path)?;
+                        this.set_language(Language::Vi, window, cx);
+                        anyhow::ensure!(this.language == Language::En && Preferences::load().language == Language::En, "Failed preference save changed the interface or persisted language");
+                        anyhow::ensure!(this.settings_error.is_some(), "Permanent preference lock did not surface an error");
+                        anyhow::ensure!(this.error == original_error, "A preference error changed the manuscript save error state");
+                        drop(reader);
+                    }
                     this.set_language(Language::Vi, window, cx);
-                    assert_eq!(Preferences::load().language, Language::Vi);
+                    anyhow::ensure!(Preferences::load().language == Language::Vi, "Vietnamese preference did not persist: {:?}", this.settings_error);
+                    anyhow::ensure!(this.settings_error.is_none(), "Recovered preference save retained its old error");
                     this.set_language(language, window, cx);
                     assert_eq!(serde_json::to_vec(&this.book).unwrap(), serde_json::to_vec(&original).unwrap(), "Changing interface language changed the manuscript");
                     this.editors[this.active].read(cx).focus.focus(window);
-                })?;
+                    Ok(())
+                })??;
                 cx.update(|window, _| crate::fonts::validate_vietnamese(window))??;
                 cx.update(|window, _| TextEditor::validate_prose_wrap(window))??;
                 let editor = this.update(cx, |this, _| this.editors[this.active].clone())?;
@@ -1067,6 +1082,7 @@ impl Oicha {
         let mut this = Self {
             language,
             settings: false,
+            settings_error: None,
             update_status: UpdateStatus::Idle,
             update_available: None,
             update_ready: None,
@@ -2401,10 +2417,12 @@ impl Oicha {
 
     fn set_language(&mut self, language: Language, window: &mut Window, cx: &mut Context<Self>) {
         if self.language == language {
+            self.settings_error = None;
+            cx.notify();
             return;
         }
         if let Err(error) = (Preferences { language }).save() {
-            self.error = Some(format!(
+            self.settings_error = Some(format!(
                 "{} {error:#}",
                 self.language
                     .choose("Không lưu được cài đặt:", "Could not save settings:")
@@ -2412,6 +2430,7 @@ impl Oicha {
             cx.notify();
             return;
         }
+        self.settings_error = None;
         self.language = language;
         self.status = language
             .text(if self.saving {
@@ -2646,6 +2665,14 @@ impl Oicha {
                         "Applies immediately. Your manuscript content stays as written.",
                     )),
             )
+            .when_some(self.settings_error.as_ref(), |d, error| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0x9b4b3e))
+                        .child(error.clone()),
+                )
+            })
             .child(
                 div()
                     .border_t_1()

@@ -45,3 +45,8 @@ a preference-save error before changing the in-memory language; the panic here
 was the smoke fixture's assertion. The successful recheck also emitted the
 previously observed nonfatal GPUI `window not found` message during guarded close;
 exit codes, saved files, PASS reports and close markers were checked separately.
+
+Follow-up in 0.2.7: the preference replacement failure was subsequently
+reproduced with native Windows OS error 5 and fixed with bounded access retries
+and a separate settings error state. See
+[PREFERENCES_FIX_VALIDATION_2026-10-18.md](PREFERENCES_FIX_VALIDATION_2026-10-18.md).

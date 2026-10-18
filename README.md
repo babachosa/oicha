@@ -4,7 +4,7 @@
 
 ## Chạy trên Windows
 
-Bộ cài: `dist/Oicha-0.2.6-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
+Bộ cài: `dist/Oicha-0.2.7-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
 
 Để tự build từ mã nguồn:
 
