@@ -138,6 +138,14 @@ pub const CATALOG: &[(&str, &str)] = &[
         "Center the cursor row · go to line 42 and center",
     ),
     (
+        "Tìm ký tự tới/lùi trong dòng · lặp lại / đảo chiều",
+        "Find a character forward/backward on the line · repeat / reverse",
+    ),
+    (
+        "Đến ký tự a thứ hai · xóa / thay / sao chép tới a",
+        "Go to the second a · delete / change / copy through a",
+    ),
+    (
         "Đầu/cuối chương · tạo dòng dưới/trên",
         "Start/end of chapter · add a line below/above",
     ),

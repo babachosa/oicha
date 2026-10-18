@@ -33,7 +33,7 @@ for ($attempt = 0; $attempt -lt 3; $attempt++) {
 if ($response.results.Count -ne $packages.Count) { throw 'Incomplete advisory scan response.' }
 # Explicit INFO Unmaintained advisories carried by the pinned GPUI dependency
 # graph. These are logged and tracked, not treated as fixed vulnerabilities.
-$informational = @('RUSTSEC-2025-0052', 'RUSTSEC-2024-0384', 'RUSTSEC-2024-0436', 'RUSTSEC-2026-0173', 'RUSTSEC-2025-0134', 'RUSTSEC-2026-0206', 'RUSTSEC-2026-0192')
+$informational = @('RUSTSEC-2025-0052', 'RUSTSEC-2024-0384', 'RUSTSEC-2024-0436', 'RUSTSEC-2026-0173', 'RUSTSEC-2025-0134', 'RUSTSEC-2026-0206', 'RUSTSEC-2026-0192', 'RUSTSEC-2026-0370', 'RUSTSEC-2026-0371', 'RUSTSEC-2026-0372')
 $findings = @()
 $blocking = @()
 for ($index = 0; $index -lt $packages.Count; $index++) {

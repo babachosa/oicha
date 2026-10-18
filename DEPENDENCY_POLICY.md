@@ -39,6 +39,18 @@ They have not been represented as fixed or silently excluded from scan results.
 | rustls-pemfile | [RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134.html) | Track upstream PEM parser migration |
 | rustybuzz | [RUSTSEC-2026-0206](https://rustsec.org/advisories/RUSTSEC-2026-0206.html) | Track upstream shaping migration |
 | ttf-parser | [RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192.html) | Track upstream font parser migration |
+| zvariant | [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html) | Track migration to zbus 6 wire module |
+| zbus_names | [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html) | Track migration to zbus 6 names module |
+| zvariant_derive | [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | Track migration to zbus 6 derive macros |
+
+Reviewed for 0.2.6 on 2026-10-18: the three new zbus-family advisories above
+are explicitly INFO Unmaintained, with no patched standalone versions. The
+upstream crates moved into zbus 6; this is a future upstream API migration,
+not a vulnerability version patch. `cargo tree --target x86_64-pc-windows-msvc
+--locked --offline -i zvariant` and the equivalent `zbus_names` query both
+have no dependency paths. These crates remain in the cross-platform lockfile,
+and their advisories remain visible in every scan. No new vulnerability advisory
+was added to the informational list and no dependency version was changed.
 
 Reassess these exceptions on every dependency upgrade. Renderer upgrades must
 pass the real native wrapping/IME/undo smoke tests; do not blindly replace the

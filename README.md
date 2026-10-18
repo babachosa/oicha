@@ -4,7 +4,7 @@
 
 ## Chạy trên Windows
 
-Bộ cài: `dist/Oicha-0.2.5-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
+Bộ cài: `dist/Oicha-0.2.6-Windows-x64-Setup.exe`. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
 
 Để tự build từ mã nguồn:
 
@@ -71,11 +71,14 @@ Vim bật mặc định. Nhấn **i** để viết, **Esc** trở lại Normal. 
 | Xóa, nối dòng, dán | `x X`, `D C`, `J`, `p P` |
 | Lịch sử | `u`, `Ctrl+R`, `Ctrl+Z`; `Ctrl+Y` redo khi Insert hoặc tắt Vim |
 | Tìm | `/`, `n`, `N`; `Ctrl+F` khi Insert hoặc tắt Vim |
+| Tìm ký tự trong dòng | `f{ký tự}` tới / `F{ký tự}` lùi; `2fa` tới chữ `a` thứ hai; `;` lặp cùng chiều, `,` lặp ngược chiều. Dùng được với Visual và `d/c/y`, ví dụ `dfa`, `cf.`, `yf,` |
 | Trang trong Vim Normal/Visual | `Ctrl+B/F` lên/xuống trang, `Ctrl+U/D` nửa trang, `Ctrl+Y/E` cuộn một hàng |
 | Lệnh | `:w`, `:wq`, `:q`, `:e`, `:new`, `:export`, `:saveas`, `:help`, `:42` |
 | File | `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+O`, `Ctrl+N` |
 | Định dạng | Nút toolbar; `Ctrl+B`, `Ctrl+I`, `Ctrl+U` khi Insert hoặc tắt Vim |
 | Xuất DOCX | `Ctrl+Shift+E` |
+
+`f/F` tìm trong dòng logic: có thể đi qua các hàng tự xuống dòng, nhưng dừng ở dấu Enter. Nhấn `Esc` để hủy khi đang chờ ký tự. Nếu không đủ số lần khớp, con trỏ và văn bản giữ nguyên, kể cả với `df/cf/yf`. Ký tự đích được hiểu nguyên văn, bao gồm chữ số, khoảng trắng, `/`, `:` và dấu tiếng Việt. `,` tìm ngược tạm thời; `;` vẫn dùng chiều của lệnh `f/F` ban đầu.
 
 Theo yêu cầu soạn tiểu thuyết, `j/k` được ánh xạ như `gj/gk` của Vim để đi từng hàng được renderer xuống dòng. Vim mặc định dùng `j/k` cho dòng logic; đây là ánh xạ có chủ đích, tương đương `nnoremap j gj`, `nnoremap k gk`, `xnoremap j gj`, `xnoremap k gk`. `0` (và Home trong Normal/Visual) dùng đầu hàng hiển thị; `v0`, `d0`, `c0`, `y0` cũng dùng biên hàng này. Chữ số `0` trong count như `10l` vẫn giữ ý nghĩa đếm. Operator `dj/dk`, `dd/yy/cc` và Visual Line vẫn theo dòng logic; `dgj/dgk` là thao tác theo hàng hiển thị. `h/l` dừng tại biên dòng, Normal đứng trên ký tự cuối, `$`/`G`/`gg`, `cw`, xóa/dán dòng cuối và số lần lặp đã có kiểm thử đối chiếu Vim thật.
 
@@ -116,7 +119,7 @@ cargo test --workspace --locked
 cargo test -p oicha-core --test security_regressions --release --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ./tools/check-dependencies.ps1
-# Đối chiếu 60 tình huống với Vim thật (cần cài Vim):
+# Đối chiếu các lệnh được hỗ trợ với Vim thật (cần cài Vim):
 cargo test -p oicha-core --test vim_reference --locked -- --ignored
 cargo build -p oicha --release --locked
 # Kiểm thử tích hợp với cửa sổ GPUI thật; path phải chưa tồn tại:

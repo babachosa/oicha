@@ -1,4 +1,6 @@
-# Validation — 2026-10-17
+# Validation — 2026-10-18
+
+Character-find changes in 0.2.6: see [VIM_FIND_VALIDATION_2026-10-18.md](VIM_FIND_VALIDATION_2026-10-18.md) for `f/F`, repeat/reverse, counted operators, Unicode handling and native dispatch checks.
 
 **Audit findings resolved in 0.2.4.** See [AUDIT_FIX_VALIDATION_2026-10-17.md](AUDIT_FIX_VALIDATION_2026-10-17.md) for final hashes, 62 passing tests, native regressions, dependency gate and the investigation of test timing/clipboard contention. The [original 0.2.3 review](AUDIT_REVIEW_2026-10-17.md) is historical.
 

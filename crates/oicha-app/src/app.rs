@@ -376,6 +376,25 @@ impl Oicha {
                 let dispatch = |key: &str, window: &mut Window, cx: &mut App| {
                     window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                 };
+                // A find target must bypass search/Ex shortcuts and counts,
+                // while still travelling through the real key handler.
+                cx.update(|_, cx| editor.update(cx, |e, cx| {
+                    let generation = e.engine.generation + 1;
+                    e.engine = oicha_core::editor::Editor::new(RichText::plain("a/b:n 0 a.b.c niềm"));
+                    e.engine.generation = generation; e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                }))?;
+                settle_editor(&editor, cx).await?;
+                for (target, expected) in [("/", 1), (":", 3), ("n", 4), ("0", 6), ("ề", "a/b:n 0 a.b.c ni".len())] {
+                    cx.update(|window, cx| { dispatch("f", window, cx); dispatch(target, window, cx); })?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.cursor == expected)?, "Native f target {target:?} was intercepted");
+                    anyhow::ensure!(this.update(cx, |this, _| this.prompt.is_none())?, "Native f target {target:?} opened a prompt");
+                }
+                cx.update(|window, cx| { for key in ["F", ".", ",", ";", "2", "F", "."] { dispatch(key, window, cx); } })?;
+                anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.cursor == 9)?, "Native counted/repeated find changed direction or partially moved on failure");
+                cx.update(|window, cx| { for key in ["c", "f", ".", "X", "escape"] { dispatch(key, window, cx); } })?;
+                anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == "a/b:n 0 aXc niềm")?, "Native cf did not change through its target");
+                cx.update(|window, cx| dispatch("u", window, cx))?;
+                anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == "a/b:n 0 a.b.c niềm")?, "Native cf was not one undo transaction");
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
                     let generation = e.engine.generation + 1;
                     e.engine = oicha_core::editor::Editor::new(RichText::plain("abcdef"));
@@ -3519,6 +3538,14 @@ impl Oicha {
             (
                 "zz · 42zz",
                 language.text("Đưa hàng có con trỏ vào giữa · đến dòng 42 rồi căn giữa"),
+            ),
+            (
+                "f{char} / F{char} · ; / ,",
+                language.text("Tìm ký tự tới/lùi trong dòng · lặp lại / đảo chiều"),
+            ),
+            (
+                "2fa · dfa / cfa / yfa",
+                language.text("Đến ký tự a thứ hai · xóa / thay / sao chép tới a"),
             ),
             (
                 "gg / G · o / O",

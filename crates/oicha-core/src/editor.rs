@@ -72,6 +72,12 @@ pub enum CaretAffinity {
     Trailing,
 }
 
+#[derive(Clone)]
+struct CharacterFind {
+    target: String,
+    backwards: bool,
+}
+
 pub struct Editor {
     pub body: RichText,
     pub cursor: usize,
@@ -92,6 +98,8 @@ pub struct Editor {
     operator_count: usize,
     pending_g: bool,
     pending_z: Option<usize>,
+    pending_find: Option<(bool, usize)>,
+    last_find: Option<CharacterFind>,
     object: Option<char>,
     visual_anchor: usize,
     preferred_column: Option<usize>,
@@ -124,6 +132,8 @@ impl Editor {
             operator_count: 1,
             pending_g: false,
             pending_z: None,
+            pending_find: None,
+            last_find: None,
             object: None,
             visual_anchor: 0,
             preferred_column: None,
@@ -596,12 +606,13 @@ impl Editor {
         self.object = None;
         self.pending_g = false;
         self.pending_z = None;
+        self.pending_find = None;
         self.operator_count = 1;
         self.object_count = 1;
     }
     pub fn pending(&self) -> String {
         format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             if self.pending_g {
                 "g"
             } else if self.pending_z.is_some() {
@@ -611,8 +622,52 @@ impl Editor {
             },
             self.operator.map(|c| c.to_string()).unwrap_or_default(),
             self.object.map(|c| c.to_string()).unwrap_or_default(),
-            self.count
+            self.count,
+            self.pending_find
+                .map(|(backwards, _)| if backwards { "F" } else { "f" })
+                .unwrap_or_default()
         )
+    }
+
+    fn find_character(&mut self, find: &CharacterFind, count: usize) -> Effect {
+        let old = self.cursor;
+        let start = if find.backwards {
+            self.line_start(old)
+        } else {
+            self.next(old).min(self.line_end(old))
+        };
+        let end = if find.backwards {
+            old
+        } else {
+            self.line_end(old)
+        };
+        let mut matches =
+            self.body.text[start..end]
+                .grapheme_indices(true)
+                .filter(|(_, grapheme)| {
+                    *grapheme == find.target
+                        || (find.target.chars().count() == 1 && grapheme.starts_with(&find.target))
+                });
+        // Determine the complete counted motion before changing any editor state.
+        // A failed find must not delete, enter Insert, or leave an operator armed.
+        let found = if find.backwards {
+            matches.rev().nth(count - 1)
+        } else {
+            matches.nth(count - 1)
+        };
+        let Some((offset, _)) = found else {
+            self.reset_pending();
+            return Effect::None;
+        };
+        let target = start + offset;
+        if let Some(op) = self.operator {
+            let end = if target > old { self.next(target) } else { old };
+            return self.operate(op, old.min(target)..end, false);
+        }
+        self.move_to(target, true);
+        self.update_visual();
+        self.reset_pending();
+        Effect::None
     }
     fn enter_insert(&mut self) {
         self.mode = Mode::Insert;
@@ -803,6 +858,25 @@ impl Editor {
         }
         if !self.vim || self.mode == Mode::Insert {
             return Effect::None;
+        }
+        if let Some((backwards, count)) = self.pending_find.take() {
+            let target = match key {
+                "space" => " ",
+                "tab" => "\t",
+                _ => key,
+            };
+            if target.graphemes(true).count() != 1
+                || target.chars().any(|c| c.is_control() && c != '\t')
+            {
+                self.reset_pending();
+                return Effect::None;
+            }
+            let find = CharacterFind {
+                target: target.into(),
+                backwards,
+            };
+            self.last_find = Some(find.clone());
+            return self.find_character(&find, count);
         }
         if let Some(line) = self.pending_z.take() {
             self.reset_pending();
@@ -1008,6 +1082,19 @@ impl Editor {
             } else {
                 self.reset_pending();
             }
+            return Effect::None;
+        }
+        if matches!(key, "f" | "F") {
+            self.pending_find = Some((key == "F", total));
+            return Effect::None;
+        }
+        if matches!(key, ";" | ",") {
+            if let Some(mut find) = self.last_find.clone() {
+                // Reversing with ',' does not change the remembered direction.
+                find.backwards ^= key == ",";
+                return self.find_character(&find, total);
+            }
+            self.reset_pending();
             return Effect::None;
         }
         if let Some(op) = self.operator {
@@ -1411,6 +1498,108 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn character_find_is_inclusive_counted_and_grapheme_safe() {
+        let mut e = editor("a niềm 🌿 a\u{0301} niềm 🌿\nniềm");
+        let original = e.body.clone();
+        keys(&mut e, &["2", "f", "ề"]);
+        assert_eq!(e.cursor, e.body.text.rfind("ềm 🌿").unwrap());
+        keys(&mut e, &["F", "🌿"]);
+        assert_eq!(e.cursor, "a niềm ".len());
+        keys(&mut e, &["f", "a"]);
+        assert_eq!(e.cursor, "a niềm 🌿 ".len());
+        assert_eq!(e.body, original);
+        assert_eq!(e.generation, 0);
+        keys(&mut e, &["v", "f", "🌿"]);
+        assert_eq!(&e.body.text[e.painted_selection()], "a\u{0301} niềm 🌿");
+        keys(&mut e, &["d"]);
+        assert_eq!(e.register.text, "a\u{0301} niềm 🌿");
+        e.undo();
+        assert_eq!(e.body, original);
+
+        let mut e = wrapped_editor();
+        keys(&mut e, &["f", "f"]);
+        assert_eq!(
+            e.cursor, 5,
+            "find follows the logical line across soft wraps"
+        );
+    }
+
+    #[test]
+    fn failed_or_cancelled_find_never_edits_or_leaks_an_operator() {
+        for prefix in [vec!["d"], vec!["c"], vec!["y"], vec!["v"], vec![]] {
+            for suffix in [
+                vec!["2", "f", "b"],
+                vec!["f", "z"],
+                vec!["F", "a"],
+                vec!["f", "escape"],
+                vec!["f", "left"],
+            ] {
+                let mut e = editor("abc\nz");
+                e.register = RichText::plain("kept");
+                keys(&mut e, &prefix);
+                let mode = e.mode;
+                keys(&mut e, &suffix);
+                assert_eq!(e.cursor, 0, "{prefix:?} {suffix:?}");
+                assert_eq!(e.body.text, "abc\nz");
+                assert_eq!(e.register.text, "kept");
+                assert_eq!(e.generation, 0);
+                assert!(e.pending().is_empty());
+                assert_eq!(
+                    e.mode,
+                    if suffix.contains(&"escape") {
+                        Mode::Normal
+                    } else {
+                        mode
+                    }
+                );
+                e.key("l");
+                assert_eq!(e.body.text, "abc\nz", "failed find leaked its operator");
+                assert_eq!(e.cursor, 1);
+            }
+        }
+        let mut e = editor("");
+        keys(&mut e, &["d", "f", "a", ";", ","]);
+        assert_eq!(e.body.text, "");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn character_find_treats_command_keys_as_literal_targets() {
+        for target in ["/", ":", "0", "2", "f", "F", ";", ",", "n", " ", "\t"] {
+            let mut e = editor(&format!("a{target}b"));
+            e.key("f");
+            assert_eq!(e.pending(), "f");
+            assert_eq!(e.key(target), super::Effect::None);
+            assert_eq!(e.cursor, 1, "{target:?}");
+            assert_eq!(e.mode, Mode::Normal);
+            assert!(e.pending().is_empty());
+        }
+        let mut e = editor("a b\tc");
+        keys(&mut e, &["f", "space", "f", "tab"]);
+        assert_eq!(e.cursor, 3);
+    }
+
+    #[test]
+    fn character_find_repeat_preserves_direction_and_operator_counts() {
+        let mut e = editor("a.b.c.d.e.f");
+        keys(&mut e, &["f", ".", "2", ";"]);
+        assert_eq!(e.cursor, 5);
+        keys(&mut e, &[",", ","]);
+        assert_eq!(e.cursor, 1);
+        keys(&mut e, &[";"]);
+        assert_eq!(e.cursor, 3);
+        keys(&mut e, &["2", "d", "2", ";"]);
+        assert_eq!(
+            e.cursor, 3,
+            "insufficient matches cancel the entire operator"
+        );
+        assert_eq!(e.body.text, "a.b.c.d.e.f");
+        keys(&mut e, &["d", "2", ";"]);
+        assert_eq!(e.body.text, "a.be.f");
+        assert_eq!(e.register.text, ".c.d.");
+    }
+
     #[test]
     fn visual_history_restores_valid_state_through_empty_unicode_bodies() {
         for visual in ["v", "V"] {
