@@ -5,6 +5,11 @@ This application uses GPUI 0.2.2, the GPU-accelerated Rust UI framework
 developed by Zed Industries, licensed under the Apache License 2.0.
 Source: https://github.com/zed-industries/zed
 
+Single-file library storage uses redb 4.4.0 by Christopher Berner,
+distributed under its MIT license (third_party/redb/LICENSE-MIT;
+installed as licenses/redb-LICENSE-MIT.txt).
+Source: https://github.com/cberner/redb
+
 This workspace vendors grid 0.18.0 by Armin Becher under the MIT license,
 with a dimension-overflow security backport. The original MIT license is
 retained in vendor/grid/LICENSE and in dist/licenses/grid-LICENSE-MIT.txt.
@@ -18,8 +23,8 @@ dist/licenses/Literata-OFL.txt. Fonts are embedded unmodified from pinned commit
 crates/oicha-app/assets/fonts/literata/README.md.
 
 The complete dependency versions are recorded in Cargo.lock. Individual
-dependencies retain their respective copyrights and licenses. This local
-development package is not a signed or publicly published distribution.
+dependencies retain their respective copyrights and licenses. Windows binaries
+are currently unsigned with Authenticode; update metadata is signed separately.
 
 The Windows installer uses NSIS 3.13, Copyright 1999-2026 Contributors;
 its applicable licenses are included as licenses/NSIS-COPYING.txt in the installed package.

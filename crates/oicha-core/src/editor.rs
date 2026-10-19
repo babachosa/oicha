@@ -771,6 +771,49 @@ impl Editor {
         }
         start..end
     }
+
+    fn delete_display_rows(&mut self, count: usize) -> Effect {
+        let (range, retained_separator) = if let Some(index) = self.display_row_index(self.cursor) {
+            let last = index
+                .saturating_add(count - 1)
+                .min(self.display_rows.len() - 1);
+            let start = self.display_rows[index].range.start;
+            let mut end = self.display_rows[last].range.end;
+            // Remove a paragraph separator only when its whole prefix is
+            // selected. Deleting just its final wrapped row must not join
+            // the surviving prefix to an untouched following paragraph.
+            let retained_separator =
+                self.body.text[end..].starts_with('\n') && start > self.line_start(end);
+            if self.body.text[end..].starts_with('\n') && !retained_separator {
+                end += 1;
+            }
+            (start..end, retained_separator)
+        } else {
+            // Before the first layout, logical lines are the available rows.
+            (self.line_range(self.cursor, count), false)
+        };
+        if range.is_empty() {
+            self.reset_pending();
+            return Effect::None;
+        }
+        let start = range.start;
+        let retain_final_row = range.end == self.body.text.len() && start > self.line_start(start);
+        self.finish_group();
+        self.register = self.body.slice(range.clone());
+        self.linewise_register = true;
+        // A final soft-wrapped row has no preceding hard separator. Insert
+        // exactly one to retain its empty writing row; existing separators
+        // (including the one before a final logical line) stay intact.
+        self.replace(range, if retain_final_row { "\n" } else { "" });
+        self.mode = Mode::Normal;
+        self.move_to(
+            start + usize::from(retain_final_row || retained_separator),
+            false,
+        );
+        self.clamp_normal();
+        self.reset_pending();
+        Effect::Clipboard
+    }
     fn visual_range(&self) -> Range<usize> {
         // Defend rendering against stale byte offsets, including offsets that
         // would split a Unicode grapheme after a body replacement.
@@ -1099,6 +1142,9 @@ impl Editor {
         }
         if let Some(op) = self.operator {
             if key == op.to_string() {
+                if op == 'd' {
+                    return self.delete_display_rows(total);
+                }
                 return self.operate(op, self.line_range(self.cursor, total), true);
             }
             if key == "i" || key == "a" {
@@ -1498,6 +1544,132 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dd_deletes_only_the_display_row_and_keeps_following_paragraphs() {
+        for (cursor, expected, at, register) in [
+            (1, "def\nx\nabcdef", 0, "abc"),
+            (4, "abc\nx\nabcdef", 4, "def"),
+            (7, "abcdef\nabcdef", 7, "x\n"),
+            (10, "abcdef\nx\ndef", 9, "abc"),
+            (13, "abcdef\nx\nabc\n", 13, "def"),
+        ] {
+            let mut e = wrapped_editor();
+            e.move_to(cursor, false);
+            let original = e.body.clone();
+            keys(&mut e, &["d", "d"]);
+            assert_eq!(e.body.text, expected, "from {cursor}");
+            assert_eq!(e.cursor, at, "from {cursor}");
+            assert_eq!(e.anchor, at);
+            assert_eq!(e.mode, Mode::Normal);
+            assert_eq!(e.register.text, register);
+            assert!(e.linewise_register);
+            assert!(e.pending().is_empty());
+            e.undo();
+            assert_eq!(e.body, original);
+            assert_eq!(e.cursor, cursor);
+            e.redo();
+            assert_eq!(e.body.text, expected);
+            assert_eq!(e.cursor, at);
+        }
+    }
+
+    #[test]
+    fn dd_at_eof_retains_a_writing_row_without_removing_the_previous_line() {
+        for (text, at, expected) in [
+            (
+                "cảnh chiều tà\nniềm tin",
+                "cảnh chiều tà\n".len(),
+                "cảnh chiều tà\n",
+            ),
+            ("a\n\nb", 3, "a\n\n"),
+            ("one", 1, ""),
+            ("", 0, ""),
+            ("one\n", 4, "one\n"),
+        ] {
+            let mut e = editor(text);
+            e.move_to(at, false);
+            keys(&mut e, &["d", "d"]);
+            assert_eq!(e.body.text, expected);
+            assert_eq!(e.cursor, expected.len());
+            let generation = e.generation;
+            keys(&mut e, &["d", "d"]);
+            assert_eq!(e.body.text, expected, "repeated dd on a final empty row");
+            assert_eq!(e.generation, generation);
+            keys(&mut e, &["i"]);
+            e.insert("viết tiếp");
+            assert_eq!(e.body.text, format!("{expected}viết tiếp"));
+        }
+    }
+
+    #[test]
+    fn counted_dd_counts_display_rows_and_is_a_single_undo() {
+        for command in [&["3", "d", "d"][..], &["d", "3", "d"][..]] {
+            let mut e = wrapped_editor();
+            e.move_to(4, false);
+            keys(&mut e, command);
+            assert_eq!(e.body.text, "abcdef");
+            assert_eq!(e.cursor, 3);
+            assert_eq!(e.register.text, "def\nx\nabc");
+            e.undo();
+            assert_eq!(e.body.text, "abcdef\nx\nabcdef");
+        }
+        let mut e = wrapped_editor();
+        e.move_to(4, false);
+        keys(&mut e, &["2", "d", "2", "d"]);
+        assert_eq!(e.body.text, "abc\n");
+        assert_eq!(e.cursor, 4);
+        assert_eq!(e.register.text, "def\nx\nabcdef");
+        let mut e = wrapped_editor();
+        keys(&mut e, &["9", "9", "d", "d"]);
+        assert_eq!(e.body.text, "");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn dd_empty_rows_and_decomposed_vietnamese_preserve_unicode_and_styles() {
+        let mut e = editor("a\n\nb");
+        e.set_display_rows(
+            [0..1, 2..2, 3..4]
+                .into_iter()
+                .map(|range| DisplayRow {
+                    range,
+                    stops: vec![],
+                })
+                .collect(),
+        );
+        keys(&mut e, &["d", "d"]);
+        assert_eq!(e.body.text, "\nb");
+        assert_eq!(
+            e.cursor, 0,
+            "following empty row must remain the active row"
+        );
+        let text = "a\u{0301}🌿niềm tin";
+        let split = "a\u{0301}🌿".len();
+        let mut e = editor(text);
+        e.body.format(split..text.len(), |style| style.bold = true);
+        let original = e.body.clone();
+        e.set_display_rows(
+            [0..split, split..text.len()]
+                .into_iter()
+                .map(|range| DisplayRow {
+                    range,
+                    stops: vec![],
+                })
+                .collect(),
+        );
+        e.move_to(split, false);
+        keys(&mut e, &["d", "d"]);
+        assert_eq!(e.body.text, "a\u{0301}🌿\n");
+        assert_eq!(e.cursor, e.body.text.len());
+        assert_eq!(e.register.text, "niềm tin");
+        assert!(e.register.runs.iter().all(|run| run.style.bold));
+        e.undo();
+        assert_eq!(e.body, original);
+        keys(&mut e, &["p"]);
+        assert_eq!(e.body.text, format!("{text}\nniềm tin"));
+        e.body.validate().unwrap();
+    }
+
     #[test]
     fn character_find_is_inclusive_counted_and_grapheme_safe() {
         let mut e = editor("a niềm 🌿 a\u{0301} niềm 🌿\nniềm");

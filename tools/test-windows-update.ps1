@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$BaselineInstaller,
     [Parameter(Mandatory)][string]$UpdateInstaller,
-    [string]$Metadata = 'dist/oicha-update.json'
+    [string]$Metadata = 'dist/oicha-update.json',
+    [switch]$ExpectLegacyDocument
 )
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
@@ -55,11 +56,23 @@ try {
         if ($hash -ne $originalLinks[$link]) { throw 'Upgrade changed an unselected shortcut option or an existing user shortcut' }
     }
     if ([IO.File]::ReadAllText($kept) -ne 'User file must survive update and uninstall') { throw 'Upgrade changed a user file' }
-    $book = Get-Content -LiteralPath $document -Raw | ConvertFrom-Json
+    if ($ExpectLegacyDocument) {
+        # 0.3 deliberately does not migrate old files. Verify the 0.2 baseline's
+        # saved JSON survived unchanged in meaning, including its last edits.
+        $book = Get-Content -LiteralPath $document -Raw | ConvertFrom-Json
+        $inspect = Join-Path $root 'legacy-inspect.json'
+        $probe = Start-Process -FilePath $exe -ArgumentList @('--inspect-store', ('"'+$document+'"'), ('"'+$inspect+'"')) -WindowStyle Hidden -PassThru -Wait
+        if ($probe.ExitCode -eq 0) { throw 'Breaking format unexpectedly accepted a legacy file' }
+    } else {
+        $inspect = Join-Path $root 'inspect.json'
+        $probe = Start-Process -FilePath $exe -ArgumentList @('--inspect-store', ('"'+$document+'"'), ('"'+$inspect+'"')) -WindowStyle Hidden -PassThru -Wait
+        if ($probe.ExitCode -ne 0) { throw 'Cannot inspect updated library' }
+        $book = (Get-Content -LiteralPath $inspect -Raw | ConvertFrom-Json).book
+    }
     if ($book.chapters[0].body.text -notmatch 'UPDATE_PRESERVE: Tiếng Việt 🌿 — unsaved text') { throw 'Unsaved text did not survive' }
     $prefs = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($document,'settings')+'/preferences.json') -Raw | ConvertFrom-Json
     if ($prefs.language -ne 'en') { throw 'English preference did not survive restart' }
-    @{ result='PASS'; baseline=$before; updated=$manifest.version; signatureVerified=$true; payloadVerified=$true; failedSaveBlocksRestart=$true; unsavedVietnamesePreserved=$true; languagePreserved=$true; helperRestart=$true; shortcutOptionsPreserved=$true; userFilesPreserved=$true; evidence=$root } |
+    @{ result='PASS'; baseline=$before; updated=$manifest.version; signatureVerified=$true; payloadVerified=$true; failedSaveBlocksRestart=$true; unsavedVietnamesePreserved=$true; languagePreserved=$true; helperRestart=$true; shortcutOptionsPreserved=$true; userFilesPreserved=$true; legacyFilePreservedAndRejected=[bool]$ExpectLegacyDocument; evidence=$root } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'results.json') -Encoding utf8NoBOM
     Copy-Item -LiteralPath (Join-Path $root 'results.json') -Destination (Join-Path $workspace 'artifacts/windows-update-qa-results.json') -Force
     "PASS: actual update $before -> $($manifest.version); evidence: $root"

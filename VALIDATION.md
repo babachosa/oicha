@@ -1,4 +1,20 @@
-# Validation — 2026-10-18
+# Validation — 2026-10-19
+
+Current release review: [RELEASE_0.3.0_VALIDATION.md](RELEASE_0.3.0_VALIDATION.md) records all unpublished changes since 0.2.7, the review fixes, deliberate format break, release checks and production update evidence.
+
+Localized notification system: [NOTIFICATIONS_VALIDATION_2026-10-19.md](NOTIFICATIONS_VALIDATION_2026-10-19.md) records short Vietnamese/English copy, separate technical details, shared severity styling and small-window modal checks.
+
+Deleted-library startup correction: [MISSING_LIBRARY_VALIDATION_2026-10-19.md](MISSING_LIBRARY_VALIDATION_2026-10-19.md) records why a deleted remembered file was recreated, the open-only startup policy and the corresponding regression tests.
+
+Latest separator correction: [SIDEBAR_BORDER_VALIDATION_2026-10-19.md](SIDEBAR_BORDER_VALIDATION_2026-10-19.md) removes the doubled top border over MANUSCRIPT and restores the sidebar dimensions changed in the preceding interpretation. Project deletion remains as implemented below.
+
+Home project actions and compact left sidebar: see [PROJECT_ACTIONS_VALIDATION_2026-10-19.md](PROJECT_ACTIONS_VALIDATION_2026-10-19.md) for transactional deletion, confirmation/cancellation, empty-library persistence and native checks.
+
+Local single-file, multi-project library update: see [LIBRARY_VALIDATION_2026-10-19.md](LIBRARY_VALIDATION_2026-10-19.md) for the breaking storage format, Home/project switching, compact UI, transaction/crash tests and current native evidence. Older sidecar backup/recovery claims below are historical and do not describe this implementation.
+
+Local, unpublished caption/close update: see [WINDOW_CLOSE_VALIDATION_2026-10-19.md](WINDOW_CLOSE_VALIDATION_2026-10-19.md) for flush caption controls, Save / Don't Save / Cancel, recovery preservation and native close-flow checks.
+
+Local, unpublished display-row `dd` change after 0.2.7: see [DD_DISPLAY_ROW_VALIDATION_2026-10-19.md](DD_DISPLAY_ROW_VALIDATION_2026-10-19.md) for row deletion, retained EOF writing space, counts, Unicode/history regressions and actual shaped-row native checks.
 
 Language preference fix in 0.2.7: see [PREFERENCES_FIX_VALIDATION_2026-10-18.md](PREFERENCES_FIX_VALIDATION_2026-10-18.md) for the reproduced Windows access error, bounded retry and preservation regressions, and final release evidence.
 
@@ -6,7 +22,7 @@ Character-find changes in 0.2.6: see [VIM_FIND_VALIDATION_2026-10-18.md](VIM_FIN
 
 **Audit findings resolved in 0.2.4.** See [AUDIT_FIX_VALIDATION_2026-10-17.md](AUDIT_FIX_VALIDATION_2026-10-17.md) for final hashes, 62 passing tests, native regressions, dependency gate and the investigation of test timing/clipboard contention. The [original 0.2.3 review](AUDIT_REVIEW_2026-10-17.md) is historical.
 
-Latest candidate: **0.2.5**. See [VIM_IME_WRITING_VALIDATION_2026-10-17.md](VIM_IME_WRITING_VALIDATION_2026-10-17.md) for the UniKey/Vim input and writing-area fixes. [CURSOR_NAVIGATION_VALIDATION.md](CURSOR_NAVIGATION_VALIDATION.md) records the earlier 0.2.3 cursor fix. [SCROLL_EDGE_VALIDATION.md](SCROLL_EDGE_VALIDATION.md) records the actual signed 0.2.1 → 0.2.2 update test. Language/updater baseline evidence is in [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md). Earlier evidence below is historical.
+Earlier candidate: **0.2.5**. See [VIM_IME_WRITING_VALIDATION_2026-10-17.md](VIM_IME_WRITING_VALIDATION_2026-10-17.md) for the UniKey/Vim input and writing-area fixes. [CURSOR_NAVIGATION_VALIDATION.md](CURSOR_NAVIGATION_VALIDATION.md) records the earlier 0.2.3 cursor fix. [SCROLL_EDGE_VALIDATION.md](SCROLL_EDGE_VALIDATION.md) records the actual signed 0.2.1 → 0.2.2 update test. Language/updater baseline evidence is in [LANGUAGE_UPDATE_VALIDATION.md](LANGUAGE_UPDATE_VALIDATION.md). Earlier evidence below is historical.
 
 Windows x64, Rust 1.98.1 MSVC, GPUI 0.2.2. This records the candidate after fixing all six findings from the earlier production review and updating popup presentation/lifecycle, zz, end scroll space and Enter-at-EOF page advance, fixed A4 display pages, automatic soft-wrap follow, smooth typing/scroll motion, bundled Vietnamese Literata typography with clean page surfaces, whole-word Vietnamese wrapping and an integrated titlebar.
 

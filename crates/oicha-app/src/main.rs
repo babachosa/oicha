@@ -6,7 +6,9 @@
 mod app;
 mod fonts;
 mod input_context;
+mod library;
 mod motion;
+mod notifications;
 mod pagination;
 mod settings;
 mod text_editor;
@@ -17,6 +19,42 @@ use app::Oicha;
 use gpui::*;
 
 fn main() {
+    // Read-only QA report from a closed library, avoiding assumptions about its
+    // binary representation in native/installer test drivers.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "--inspect-store")
+    {
+        let result = (|| -> anyhow::Result<()> {
+            let path = std::env::args_os()
+                .nth(2)
+                .map(std::path::PathBuf::from)
+                .expect("library path");
+            let output = std::env::args_os()
+                .nth(3)
+                .map(std::path::PathBuf::from)
+                .expect("report path");
+            let (mut store, book, recovered) = oicha_core::storage::Store::open(path)?;
+            let summaries = store.projects()?;
+            let mut projects = vec![];
+            for summary in summaries {
+                let (manuscript, recovered) = store.select_project(summary.id)?;
+                projects.push(serde_json::json!({"id":summary.id,"manuscript":manuscript,"recovered":recovered}));
+            }
+            oicha_core::storage::atomic_write(
+                &output,
+                &serde_json::to_vec_pretty(
+                    &serde_json::json!({"book":book,"recovered":recovered,"projects":projects}),
+                )?,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|s| s == "--update-verify")
@@ -24,7 +62,23 @@ fn main() {
         if let Some(path) = std::env::args_os().nth(2) {
             let path = std::path::PathBuf::from(path);
             let result = (|| -> anyhow::Result<()> {
-                let (_, book, _) = oicha_core::storage::Store::open(path.clone())?;
+                // QA only: a breaking-format upgrade must preserve the old
+                // JSON bytes, not migrate/import them. Normal startup still
+                // rejects legacy files. The driver checks their original text.
+                let book = match oicha_core::storage::Store::open(path.clone()) {
+                    Ok((_, book, _)) => book,
+                    Err(_) => {
+                        let bytes = std::fs::read(&path)?;
+                        anyhow::ensure!(
+                            bytes.len() <= 64 * 1024 * 1024,
+                            "Legacy QA file exceeds limit"
+                        );
+                        let book: oicha_core::document::Manuscript =
+                            serde_json::from_slice(&bytes)?;
+                        book.validate()?;
+                        book
+                    }
+                };
                 anyhow::ensure!(
                     book.chapters[0]
                         .body
@@ -87,9 +141,16 @@ fn main() {
             .expect("--smoke-test requires an isolated .oicha path");
         let mut store =
             oicha_core::storage::Store::create(path.clone()).expect("create smoke manuscript");
-        store
-            .save(&oicha_core::document::Manuscript::demo())
-            .expect("save smoke manuscript");
+        if !args.iter().any(|s| s == "--library-smoke") {
+            store
+                .save(&oicha_core::document::Manuscript::demo())
+                .expect("save smoke manuscript");
+        }
+        drop(store);
+        if args.iter().any(|s| s == "--missing-library-smoke") {
+            // Only our just-created, create_new-guarded QA fixture is removed.
+            std::fs::remove_file(&path).expect("remove owned startup fixture");
+        }
         Some(path)
     } else {
         args.first().map(std::path::PathBuf::from)
@@ -144,7 +205,28 @@ fn main() {
             move |window, cx| {
                 let entity = cx.new(|cx| Oicha::new(path, window, cx));
                 if smoke {
-                    if let Some(index) = args.iter().position(|arg| arg == "--update-fixture") {
+                    if args.iter().any(|arg| arg == "--missing-library-smoke") {
+                        entity.update(cx, |app, cx| {
+                            app.start_missing_library_smoke(
+                                std::path::PathBuf::from(&args[1]),
+                                window,
+                                cx,
+                            )
+                        });
+                    } else if args.iter().any(|arg| arg == "--project-actions-smoke") {
+                        entity.update(cx, |app, cx| app.start_project_actions_smoke(window, cx));
+                    } else if args.iter().any(|arg| arg == "--library-smoke") {
+                        entity.update(cx, |app, cx| app.start_library_smoke(window, cx));
+                    } else if let Some(index) = args.iter().position(|arg| arg == "--close-smoke") {
+                        let scenario = args
+                            .get(index + 1)
+                            .and_then(|s| s.to_str())
+                            .expect("close scenario")
+                            .to_owned();
+                        entity.update(cx, |app, cx| app.start_close_smoke(scenario, window, cx));
+                    } else if let Some(index) =
+                        args.iter().position(|arg| arg == "--update-fixture")
+                    {
                         let envelope = args
                             .get(index + 1)
                             .map(std::path::PathBuf::from)

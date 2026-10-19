@@ -69,12 +69,18 @@ try {
     if (![OichaCaptionProbe]::IsIconic($captionHandle)) { throw 'Custom minimize did not minimize the native window' }
     $null = [OichaCaptionProbe]::ShowWindowAsync($captionHandle, 9)
     Start-Sleep -Milliseconds 250
+    # The titlebar fixture exercises a clean close. Dirty-close choices are
+    # covered separately; let the normal autosave finish the preview edits.
+    Start-Sleep -Milliseconds 2500
     $point = Get-CaptionPoint -FromRight 27
     Test-CaptionHit 'close' $point 20
     Invoke-CaptionClick $point 20
     if (!$captionProcess.WaitForExit(10000)) { throw 'Custom close did not finish saving and close' }
     if ($captionProcess.ExitCode -ne 0) { throw 'Caption fixture exited unsuccessfully' }
-    $captionSaved = Get-Content -LiteralPath $captionBook -Raw | ConvertFrom-Json
+    $captionInspect = Join-Path $captionDirectory 'inspect.json'
+    $probe = Start-Process -FilePath $captionExe -ArgumentList @('--inspect-store', ('"' + $captionBook + '"'), ('"' + $captionInspect + '"')) -WindowStyle Hidden -PassThru -Wait
+    if ($probe.ExitCode -ne 0) { throw 'Cannot inspect saved caption fixture.' }
+    $captionSaved = (Get-Content -LiteralPath $captionInspect -Raw | ConvertFrom-Json).book
     if ($PreviewKind -eq 'pages-top' -and $captionSaved.chapters[0].body.text -notmatch 'Mưa rơi ngoài hiên') { throw 'Custom close failed to save the preview edits' }
     if ($captionSaved.chapters.Count -lt 1) { throw 'Caption close lost the manuscript' }
     @{ result = 'PASS'; preview = $PreviewKind; pid = $captionProcess.Id; dragHit = 2; topResizeHit = 12; maximizeRestore = $true; minimize = $true; closeAndPersist = $true } |

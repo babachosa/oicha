@@ -37,6 +37,7 @@ New-Item -ItemType Directory -Path (Join-Path $payload 'licenses') -Force | Out-
 Copy-Item -LiteralPath $app -Destination (Join-Path $payload 'Oicha.exe')
 Copy-Item -LiteralPath (Join-Path $workspace 'LICENSE'),(Join-Path $workspace 'NOTICE') -Destination $payload
 $licenseSources = @{
+    'third_party/redb/LICENSE-MIT' = 'redb-LICENSE-MIT.txt'
     'vendor/grid/LICENSE' = 'grid-LICENSE-MIT.txt'
     'vendor/grid/OICHA_PATCH.md' = 'grid-security-backport.md'
     'crates/oicha-app/assets/fonts/literata/OFL.txt' = 'Literata-OFL.txt'

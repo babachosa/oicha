@@ -1,18 +1,19 @@
-Oicha 0.2.7 fixes intermittent language preference persistence on Windows.
+Oicha 0.3.0 — kho tiểu thuyết và thông báo mới
 
-- Brief Windows access/sharing errors during atomic replacement of the settings
-  file are retried with bounded backoff. The previous file remains intact.
-- Preference reads also retry brief access/sharing errors rather than immediately
-  falling back to the default language.
-- A persistent settings-save failure keeps the previous language and displays an
-  error in Settings. It does not block manuscript autosave, and a successful retry
-  clears the settings error.
-- Native QA reports preference failures with diagnostic details instead of
-  aborting in a native callback assertion.
+- Một file .oicha chứa nhiều dự án. Trang chủ giúp tạo, chọn và xóa dự án qua menu ba chấm có xác nhận.
+- Định dạng kho mới là breaking change: không mở hoặc chuyển đổi file .oicha của bản 0.2.x. File cũ được giữ nguyên. Hãy xuất TXT/DOCX bằng bản cũ trước khi nâng cấp nếu cần giữ nội dung để sử dụng bên ngoài app.
+- dd xóa hàng đang hiển thị, kể cả đoạn tự xuống hàng; giữ chỗ viết trống khi xóa hàng cuối.
+- Nút đóng hỏi Lưu / Không lưu / Hủy khi còn thay đổi chưa lưu. Các nút cửa sổ sát mép trên; giao diện gọn hơn.
+- Không tự tạo lại kho đã bị xóa hoặc di chuyển. Lần đầu dùng app vẫn mở Trang chủ bình thường.
+- Thông báo ngắn gọn, thống nhất Việt/Anh; chi tiết kỹ thuật chỉ hiện khi mở Chi tiết. Hộp thoại dài cuộn được trong cửa sổ nhỏ.
+- Cảnh báo lệnh Vim không chặn tự lưu. Các dự án được lưu trong giao dịch trên cùng một file, không sinh file phụ.
 
-The failure was reproduced with OS error 5 during repeated writes in OneDrive
-and with a controlled Windows file lock. Regression checks cover lock release,
-persistent lock preservation, temporary read locks and 2,000 preference changes.
-The Vim f/F, ; and , commands introduced in 0.2.6 are retained.
+Oicha 0.3.0 — project libraries and clearer notifications
 
-The Windows installer remains unsigned with Authenticode; update metadata is signed.
+- Keep multiple novels in one .oicha file. Use Home to create, switch or delete projects with confirmation.
+- Breaking storage change: 0.2.x .oicha files are preserved but cannot be opened or converted. Export TXT/DOCX with the older app before upgrading if you need the text outside Oicha.
+- dd deletes the displayed row and retains writing space at the end. Closing offers Save / Don't Save / Cancel for unsaved edits.
+- Deleted libraries stay deleted. New users start on Home without a missing-file warning.
+- Short, fully localized notices separate technical details from guidance; long dialogs scroll. Vim notices no longer pause autosave.
+
+Windows x64. The installer is unsigned with Authenticode; update metadata is signed with Ed25519.

@@ -55,13 +55,22 @@ key rotation requires a deliberate migration release.
 
 ## Verification
 
+Version 0.3.0 deliberately replaces the single-manuscript JSON format with the
+multi-project library format. Legacy files remain intact and are rejected by
+normal startup, without migration. For an actual 0.2.x baseline, pass
+`-ExpectLegacyDocument` to the update test: it checks that the old app saved its
+pending text, the helper installed/restarted the new version, and the old file
+and language preference survived. The `--update-verify` QA-only path can inspect
+legacy JSON for that assertion; it does not import it into the writing UI.
+New-format baselines are inspected through `--inspect-store`, not a JSON reader.
+
 `cargo test --workspace --locked` covers invalid signatures, modified metadata,
 wrong platforms/URLs, truncated/corrupt/oversized downloads, cleanup, HTTPS-only
 transport, semantic version comparisons and preferences persistence.
 
 `tools/test-windows-update.ps1 -BaselineInstaller OLD.exe -UpdateInstaller NEW.exe`
 installs an isolated baseline, runs the real installed app and helper, deliberately
-causes a save conflict to verify restart is blocked, restores the test document,
+causes a save failure to verify restart is blocked, restores the test state,
 then upgrades. The restarted executable verifies its new version, unsaved
 Vietnamese/emoji text and English preference. The script checks all installed
 payload hashes, registry version, preserved shortcut choices and user files,

@@ -1,5 +1,5 @@
 #requires -Version 7.2
-param([string]$Installer, [string]$OutputDirectory = 'artifacts/installer-qa')
+param([string]$Installer, [string]$OutputDirectory = 'artifacts/installer-qa', [switch]$PreserveShortcuts, [switch]$SkipCaptionProbe)
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $workspace
@@ -16,7 +16,11 @@ $progId = 'HKCU:/Software/Classes/Oicha.Manuscript'
 $desktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Oicha.lnk'
 $menuLink = Join-Path ([Environment]::GetFolderPath('Programs')) 'Oicha/Oicha.lnk'
 foreach ($key in @($appKey,$uninstallKey,$progId)) { if (Test-Path -LiteralPath $key) { throw "Existing user installation/association must be preserved: $key" } }
-foreach ($link in @($desktopLink,$menuLink)) { if (Test-Path -LiteralPath $link) { throw "Existing user shortcut must be preserved: $link" } }
+$originalLinks = @{}
+foreach ($link in @($desktopLink,$menuLink)) {
+    if ((Test-Path -LiteralPath $link) -and !$PreserveShortcuts) { throw "Existing user shortcut must be preserved: $link" }
+    $originalLinks[$link] = $(if (Test-Path -LiteralPath $link) { (Get-FileHash -LiteralPath $link).Hash } else { $null })
+}
 $qaRoot = Join-Path $workspace ($OutputDirectory + '-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $qaRoot -Force | Out-Null
 $installDirectory = Join-Path $qaRoot 'Bản cài có khoảng trắng'
@@ -61,12 +65,15 @@ function Read-NativeShortcut([string]$Path) {
     @{ target=$item.ExtendedProperty('System.Link.TargetParsingPath'); icon=$icon; index=[BitConverter]::ToInt32($data,56) }
 }
 try {
-    Invoke-Setup @('/S','/DESKTOP','/ASSOC',('/D='+$installDirectory))
+    $setupOptions = @('/S','/ASSOC',('/D='+$installDirectory))
+    if ($PreserveShortcuts) { $setupOptions = @('/S','/NOSTARTMENU','/ASSOC',('/D='+$installDirectory)) }
+    else { $setupOptions = @('/S','/DESKTOP','/ASSOC',('/D='+$installDirectory)) }
+    Invoke-Setup $setupOptions
     Check-Payload
     $registration = Get-ItemProperty -LiteralPath $uninstallKey
     if ($registration.InstallLocation -ne $installDirectory -or $registration.DisplayIcon -ne ($exe+',0')) { throw 'Installed Apps metadata is incorrect' }
     $shortcutEvidence = @()
-    foreach ($link in @($desktopLink,$menuLink)) {
+    foreach ($link in $(if ($PreserveShortcuts) { @() } else { @($desktopLink,$menuLink) })) {
         $shortcut = Read-NativeShortcut $link
         if (Test-Path -LiteralPath $link) { Copy-Item -LiteralPath $link -Destination (Join-Path $qaRoot ([IO.Path]::GetFileName((Split-Path $link -Parent))+'-shortcut.lnk')) }
         $shortcutEvidence += @{ path=$link; exists=(Test-Path -LiteralPath $link); target=$shortcut.target; icon=$shortcut.icon; expected=$exe }
@@ -101,21 +108,32 @@ try {
     $blockedUninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/S',('_?='+$installDirectory)) -WindowStyle Hidden -PassThru
     if (!$blockedUninstall.WaitForExit(10000) -or $blockedUninstall.ExitCode -ne 2) { throw 'Uninstall did not safely reject the running app' }
     if ($fixture.HasExited -or !(Test-Path -LiteralPath $exe)) { throw 'Installer/uninstaller force-closed or deleted the running app' }
+    # Allow the ordinary two-second autosave to commit the preview edits before
+    # requesting a clean close. Dirty-close choices are tested by native-close.
+    Start-Sleep -Milliseconds 2500
     if (!$fixture.CloseMainWindow() -or !$fixture.WaitForExit(10000)) { throw 'Fixture did not close/save gracefully' }
     $fixture = $null
     & (Join-Path $PSScriptRoot 'native-smoke.ps1') -Executable $exe -OutputDirectory (Join-Path $qaRoot 'native')
-    & (Join-Path $PSScriptRoot 'native-window-smoke.ps1') -Executable $exe -OutputDirectory (Join-Path $qaRoot 'caption')
+    if (!$SkipCaptionProbe) { & (Join-Path $PSScriptRoot 'native-window-smoke.ps1') -Executable $exe -OutputDirectory (Join-Path $qaRoot 'caption') }
     $remove = Start-Process -FilePath $uninstaller -ArgumentList '/S' -WindowStyle Hidden -PassThru
     if (!$remove.WaitForExit(10000)) { throw 'Uninstaller launcher did not exit' }
     for ($attempt = 0; $attempt -lt 200; $attempt++) {
         if (!(Test-Path -LiteralPath $exe) -and !(Test-Path -LiteralPath $uninstaller) -and !(Test-Path -LiteralPath $appKey)) { break }
         Start-Sleep -Milliseconds 50
     }
-    foreach ($path in @($exe,$uninstaller,$appKey,$uninstallKey,$progId,$desktopLink,$menuLink)) {
+    $removedItems = @($exe,$uninstaller,$appKey,$uninstallKey,$progId)
+    if (!$PreserveShortcuts) { $removedItems += @($desktopLink,$menuLink) }
+    foreach ($path in $removedItems) {
         if (Test-Path -LiteralPath $path) { throw "Uninstall did not remove its owned item: $path" }
     }
+    if ($PreserveShortcuts) {
+        foreach ($link in @($desktopLink,$menuLink)) {
+            $hash = $(if (Test-Path -LiteralPath $link) { (Get-FileHash -LiteralPath $link).Hash } else { $null })
+            if ($hash -ne $originalLinks[$link]) { throw 'Installer changed an existing user shortcut' }
+        }
+    }
     if ([IO.File]::ReadAllText($kept) -ne 'preserved manuscript' -or [IO.File]::ReadAllText($appDataProbe) -ne 'user data must survive uninstall') { throw 'Uninstall removed user data' }
-    @{ result='PASS'; installer=$installerPath; installDirectory=$installDirectory; upgrade=$true; downgradeBlocked=$true; unmanagedFolderProtected=$true; runningAppProtected=$true; bundledRuntimeUsed=$true; shortcutsAndIcons=$true; quotedAssociation=$true; installedNativeRegressions=$true; uninstallPreservesUserData=$true } |
+    @{ result='PASS'; installer=$installerPath; installDirectory=$installDirectory; upgrade=$true; downgradeBlocked=$true; unmanagedFolderProtected=$true; runningAppProtected=$true; bundledRuntimeUsed=$true; shortcutsAndIcons=(!$PreserveShortcuts); existingShortcutsPreserved=[bool]$PreserveShortcuts; quotedAssociation=$true; installedNativeRegressions=$true; captionProbe=(!$SkipCaptionProbe); uninstallPreservesUserData=$true } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $qaRoot 'results.json') -Encoding utf8NoBOM
     Copy-Item -LiteralPath (Join-Path $qaRoot 'results.json') -Destination (Join-Path $workspace 'artifacts/windows-installer-qa-results.json') -Force
     "PASS: installer lifecycle; evidence: $qaRoot"

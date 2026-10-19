@@ -11,10 +11,7 @@ pub const CATALOG: &[(&str, &str)] = &[
         "Save failed · use Save as to choose another file",
     ),
     ("Đã lưu bản thảo mới", "Saved new manuscript"),
-    (
-        "Mở bản thảo .oicha, .txt hoặc .recovery",
-        "Open an .oicha, .txt or .recovery manuscript",
-    ),
+    ("Mở kho dự án .oicha", "Open an .oicha project library"),
     ("Đã phục hồi bản thảo", "Recovered manuscript"),
     ("Đã mở bản thảo", "Opened manuscript"),
     ("Thay thế file đã có?", "Replace the existing file?"),
@@ -156,6 +153,10 @@ pub const CATALOG: &[(&str, &str)] = &[
     (
         "Thao tác dòng và lệnh có số lần lặp",
         "Line operations and commands with counts",
+    ),
+    (
+        "Xóa hàng hiển thị · giữ hàng trống ở cuối bản thảo",
+        "Delete display rows · keep an empty writing row at the end",
     ),
     (
         "Thao tác với từ trong / cả khoảng trắng",

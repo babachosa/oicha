@@ -1,15 +1,16 @@
+use crate::notifications::{Kind as NoticeKind, Notification, Tone};
 use crate::settings::{Language, Preferences, ui_format};
 use crate::text_editor::{EditorEvent, TextEditor};
 use gpui::{prelude::*, *};
 use oicha_core::{
     document::{Manuscript, RichText},
     export,
-    storage::{Store, atomic_write},
+    storage::{ProjectSummary, Store, atomic_write},
 };
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const INK: u32 = 0x303b35;
@@ -24,7 +25,6 @@ enum PromptKind {
     Author,
     Chapter(u64),
     Synopsis(u64),
-    Goal,
     Search,
     Command,
 }
@@ -36,6 +36,7 @@ struct Prompt {
 }
 enum ConfirmAction {
     DeleteChapter(u64),
+    DeleteProject(u64),
     Export {
         book: Box<Manuscript>,
         path: PathBuf,
@@ -52,8 +53,17 @@ enum Pending {
     Close,
     Update,
     New,
+    Home,
+    Project(u64),
     Open(PathBuf),
     Loaded(Box<LoadedBook>),
+}
+
+#[derive(Clone, Copy)]
+enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 struct LoadedBook {
@@ -62,15 +72,30 @@ struct LoadedBook {
     recovered: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoticeSlot {
+    Main,
+    Settings,
+    Close,
+    Update,
+}
+
 pub struct Oicha {
     language: Language,
     settings: bool,
-    settings_error: Option<String>,
+    settings_error: Option<Notification>,
     update_status: UpdateStatus,
     update_available: Option<oicha_update::Available>,
     update_ready: Option<oicha_update::Prepared>,
     update_progress: Arc<std::sync::atomic::AtomicU64>,
     book: Manuscript,
+    home: bool,
+    has_project: bool,
+    switching_project: bool,
+    deleting_project: bool,
+    projects: Vec<ProjectSummary>,
+    project_menu: Option<u64>,
+    project_menu_anchor: Point<Pixels>,
     editors: Vec<Entity<TextEditor>>,
     active: usize,
     store: Option<Arc<Mutex<Store>>>,
@@ -79,9 +104,14 @@ pub struct Oicha {
     saving: bool,
     io_busy: bool,
     pending: Option<Pending>,
+    close_prompt: bool,
+    close_save_authorized: bool,
+    close_selection: usize,
+    close_error: Option<Notification>,
     status: String,
-    error: Option<String>,
-    notice: Option<String>,
+    error: Option<Notification>,
+    notice: Option<Notification>,
+    expanded_notice: Option<(NoticeSlot, Notification)>,
     recovered: bool,
     focus_mode: bool,
     help: bool,
@@ -98,7 +128,6 @@ pub struct Oicha {
     family: String,
     spacing: f32,
     vim: bool,
-    session_start_words: usize,
     _subscriptions: Vec<Subscription>,
     _autosave: Task<()>,
 }
@@ -110,7 +139,7 @@ enum UpdateStatus {
     Available,
     Downloading,
     Ready,
-    Failed(String),
+    Failed(Notification),
 }
 
 fn data_dir() -> PathBuf {
@@ -126,15 +155,8 @@ fn remember(path: &Path) {
         return;
     }
     if let Some(path) = path.to_str() {
-        let _ = atomic_write(&data_dir().join("last-session"), path.as_bytes());
+        let _ = atomic_write(&data_dir().join("last-library"), path.as_bytes());
     }
-}
-fn scratch() -> anyhow::Result<(Store, PathBuf)> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = data_dir()
-        .join("manuscripts")
-        .join(format!("manuscript-{now}.oicha"));
-    Ok((Store::create(path.clone())?, path))
 }
 
 async fn settle_editor(
@@ -162,10 +184,200 @@ async fn settle_editor(
     )
 }
 
+async fn settle_library(
+    this: &WeakEntity<Oicha>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    for _ in 0..200 {
+        cx.background_executor()
+            .timer(Duration::from_millis(25))
+            .await;
+        if this.update(cx, |this, _| {
+            !this.saving && !this.io_busy && this.pending.is_none()
+        })? {
+            anyhow::ensure!(
+                this.update(cx, |this, _| this.error.is_none())?,
+                "Library action failed"
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Library transition did not settle")
+}
+
 impl Oicha {
+    pub fn start_missing_library_smoke(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                cx.background_executor().timer(Duration::from_millis(2200)).await;
+                anyhow::ensure!(!path.exists(), "Deleted library was recreated");
+                anyhow::ensure!(this.update(cx, |this, _| this.home && this.store.is_none() && this.path.is_none() && !this.has_project && this.projects.is_empty() && this.error.as_ref().is_some_and(|e| e.kind == NoticeKind::MissingLibrary) && !this.io_busy && !this.saving && this.prompt.is_none() && this.pending.is_none())?, "Missing library did not stay on empty Home without a save dialog");
+                Ok(())
+            }.await;
+            let output = match result { Ok(()) => "PASS: deleted startup library remains absent after autosave interval; empty Home, clear error, no save dialog".into(), Err(e) => format!("FAIL: {e:#}") };
+            let _ = atomic_write(&path.with_extension("missing-library-test.txt"), output.as_bytes());
+            let _ = this.update_in(cx, |this, window, cx| this.request_close(window, cx));
+        }).detach();
+    }
+
+    pub fn start_project_actions_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.path.clone().unwrap();
+        self.go_home(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                settle_library(&this, cx).await?;
+                let first = this.update(cx, |this, _| this.projects[0].id)?;
+                this.update_in(cx, |this, window, cx| this.toggle_project_menu(first, point(px(400.), px(250.)), window, cx))?;
+                cx.update(|window, cx| window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx))?;
+                anyhow::ensure!(this.update(cx, |this, _| this.project_menu.is_none() && this.home && this.projects.len() == 1)?, "Escape did not dismiss project actions");
+                this.update_in(cx, |this, window, cx| this.toggle_project_menu(first, point(px(400.), px(250.)), window, cx))?;
+                cx.update(|window, cx| window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx))?;
+                anyhow::ensure!(this.update(cx, |this, _| this.confirmation.is_some() && this.project_menu.is_none() && this.home)?, "Menu action opened the project instead of confirmation");
+                cx.update(|window, cx| window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx))?;
+                cx.background_executor().timer(Duration::from_millis(180)).await;
+                anyhow::ensure!(this.update(cx, |this, _| this.confirmation.is_none() && this.projects.len() == 1)?, "Default Enter deleted a project instead of cancelling");
+                this.update_in(cx, |this, window, cx| this.new_book(window, cx))?;
+                settle_library(&this, cx).await?;
+                let second = this.update(cx, |this, _| this.store.as_ref().unwrap().lock().unwrap().selected_project().unwrap())?;
+                this.update_in(cx, |this, window, cx| {
+                    this.editors[0].update(cx, |e, cx| { e.engine.key("i"); e.replace_text_in_range(None, "Giữ nguyên dự án đang viết 🌿", window, cx); e.engine.escape(); });
+                    this.go_home(window, cx);
+                })?;
+                settle_library(&this, cx).await?;
+                this.update_in(cx, |this, window, cx| { this.confirm_delete_project(first, window, cx); this.accept_confirmation(window, cx); this.accept_confirmation(window, cx); })?;
+                settle_library(&this, cx).await?;
+                cx.background_executor().timer(Duration::from_millis(180)).await;
+                anyhow::ensure!(this.update(cx, |this, _| this.home && this.projects.len() == 1 && this.projects[0].id == second && this.has_project && this.book.chapters[0].body.text == "Giữ nguyên dự án đang viết 🌿")?, "Deleting another project changed the current manuscript");
+                this.update_in(cx, |this, window, cx| this.delete_project(u64::MAX, window, cx))?;
+                for _ in 0..100 {
+                    cx.background_executor().timer(Duration::from_millis(25)).await;
+                    if this.update(cx, |this, _| !this.io_busy)? { break; }
+                }
+                anyhow::ensure!(this.update(cx, |this, _| this.error.is_some() && this.projects.len() == 1 && this.has_project && !this.deleting_project)?, "Failed delete removed live state or left the UI busy");
+                this.update_in(cx, |this, window, cx| { this.error = None; this.confirm_delete_project(second, window, cx); })?;
+                cx.update(|window, cx| { for key in ["tab", "enter", "enter"] { window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx); } })?;
+                settle_library(&this, cx).await?;
+                cx.background_executor().timer(Duration::from_millis(2200)).await;
+                this.update_in(cx, |this, window, cx| this.save(window, cx))?;
+                anyhow::ensure!(this.update(cx, |this, _| this.home && !this.has_project && this.projects.is_empty() && this.store.as_ref().unwrap().lock().unwrap().selected_project().is_none())?, "Autosave recreated the final deleted project");
+                this.update(cx, |this, _| -> anyhow::Result<()> { anyhow::ensure!(this.store.as_ref().unwrap().lock().unwrap().projects()?.is_empty(), "Deletion was not persisted"); Ok(()) })??;
+                Ok(())
+            }.await;
+            let output = match result { Ok(()) => "PASS: menu Escape, menu Enter, safe default cancel, inactive/current/final project deletion, duplicate confirm, failed delete preservation, no autosave resurrection".into(), Err(e) => format!("FAIL: {e:#}") };
+            let _ = atomic_write(&path.with_extension("project-actions-test.txt"), output.as_bytes());
+            let _ = this.update_in(cx, |_, window, _| window.remove_window());
+        }).detach();
+    }
+
+    /// Exercises the real Home/save/project state machine in an isolated file.
+    pub fn start_library_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.path.clone().unwrap();
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                anyhow::ensure!(this.update(cx, |this, _| this.home && !this.has_project && this.projects.is_empty())?, "First launch is not an empty Home");
+                cx.update(|window, cx| { for key in ["i", "a", "ctrl-f", "escape"] { window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx); } })?;
+                anyhow::ensure!(this.update(cx, |this, cx| this.book.words() == 0 && this.prompt.is_none() && this.editors[0].read(cx).engine.body.text.is_empty())?, "Home edited a hidden manuscript");
+                cx.update(|window, cx| window.dispatch_keystroke(Keystroke::parse("ctrl-n").unwrap(), cx))?;
+                settle_library(&this, cx).await?;
+                let first = this.update(cx, |this, _| this.store.as_ref().unwrap().lock().unwrap().selected_project().unwrap())?;
+                this.update_in(cx, |this, window, cx| {
+                    this.book.title = "Tiểu thuyết một 🌿".into();
+                    this.editors[this.active].update(cx, |e, cx| { e.engine.key("i"); e.replace_text_in_range(None, "Niềm tin — dự án thứ nhất.", window, cx); e.engine.escape(); });
+                    this.dirty(cx);
+                    this.command("unsupported-qa-command", window, cx);
+                })?;
+                let mut autosaved = false;
+                for _ in 0..100 {
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    if this.update(cx, |this, _| !this.saving && this.saved_revision == this.book.revision)? {
+                        autosaved = true;
+                        break;
+                    }
+                }
+                anyhow::ensure!(autosaved && this.update(cx, |this, _| this.error.as_ref().is_some_and(|notice| notice.kind == NoticeKind::UnsupportedCommand))?, "A Vim notice blocked autosave or was erased by a successful autosave");
+                this.update_in(cx, |this, window, cx| {
+                    this.error = None;
+                    this.dirty(cx);
+                    this.go_home(window, cx);
+                })?;
+                settle_library(&this, cx).await?;
+                anyhow::ensure!(this.update(cx, |this, _| this.home && this.projects.len() == 1 && this.projects[0].title == "Tiểu thuyết một 🌿")?, "Home did not refresh the first saved project");
+                this.update_in(cx, |this, window, cx| this.new_book(window, cx))?;
+                settle_library(&this, cx).await?;
+                let second = this.update(cx, |this, _| this.store.as_ref().unwrap().lock().unwrap().selected_project().unwrap())?;
+                anyhow::ensure!(first != second && this.update(cx, |this, _| !this.home && this.book.words() == 0 && this.projects.len() == 2)?, "New project reused the previous document or created another file");
+                this.update_in(cx, |this, window, cx| {
+                    this.book.title = "Novel two".into();
+                    this.editors[this.active].update(cx, |e, cx| { e.engine.key("i"); e.replace_text_in_range(None, "Second project stays independent.", window, cx); e.engine.escape(); });
+                    this.dirty(cx);
+                    this.go_home(window, cx);
+                })?;
+                settle_library(&this, cx).await?;
+                this.update_in(cx, |this, window, cx| this.open_project(first, window, cx))?;
+                settle_library(&this, cx).await?;
+                anyhow::ensure!(this.update(cx, |this, _| this.book.title == "Tiểu thuyết một 🌿" && this.book.chapters[0].body.text == "Niềm tin — dự án thứ nhất.")?, "Switching projects lost or mixed Vietnamese text");
+                this.update_in(cx, |this, window, cx| {
+                    this.book.author = "Tác giả thử nghiệm".into(); this.dirty(cx);
+                    this.save(window, cx); this.go_home(window, cx);
+                })?;
+                settle_library(&this, cx).await?;
+                anyhow::ensure!(this.update(cx, |this, _| this.home && this.projects.iter().any(|p| p.id == first && p.author == "Tác giả thử nghiệm"))?, "Home was lost while a save was in flight");
+                this.update_in(cx, |this, window, cx| this.open_project(second, window, cx))?;
+                settle_library(&this, cx).await?;
+                anyhow::ensure!(this.update(cx, |this, _| this.path.as_ref() == Some(&path) && this.book.title == "Novel two" && this.book.chapters[0].body.text == "Second project stays independent.")?, "Second project changed after switching");
+                this.update_in(cx, |this, window, cx| {
+                    this.set_language(Language::En, window, cx);
+                    this.go_home(window, cx);
+                })?;
+                settle_library(&this, cx).await?;
+                Ok(())
+            }.await;
+            let output = match result { Ok(()) => "PASS: empty Home, isolated input, two projects in one library, Unicode edits, Vim notice does not block autosave, save-before-switch, Home during save, English UI".into(), Err(e) => format!("FAIL: {e:#}") };
+            let _ = atomic_write(&path.with_extension("library-test.txt"), output.as_bytes());
+            let _ = this.update_in(cx, |_, window, _| window.remove_window());
+        }).detach();
+    }
+
     /// Isolated visual QA, available only under the explicit smoke-test flag.
     pub fn preview_popup(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
+            "notification" | "notification-success" | "notification-settings" => {
+                self.home = true;
+                self.notice = Some(Notification::new(NoticeKind::UpdateComplete));
+                if kind != "notification-success" {
+                    self.error = Some(Notification::open_library(&anyhow::Error::new(
+                        std::io::Error::from(std::io::ErrorKind::NotFound),
+                    ).context("Cannot access library C:\\Users\\writer\\Downloads\\Tiểu-thuyết.oicha")));
+                }
+                if kind == "notification-settings" {
+                    self.begin_modal();
+                    self.settings = true;
+                    self.settings_error = Some(Notification::failure(
+                        NoticeKind::Settings,
+                        &anyhow::anyhow!("Access denied (os error 5)"),
+                    ));
+                    self.update_status = UpdateStatus::Failed(Notification::failure(
+                        NoticeKind::DownloadUpdate,
+                        &anyhow::anyhow!("Network connection interrupted"),
+                    ));
+                }
+                self.modal_focus.focus(window);
+            }
+            "home" => {
+                self.home = true;
+                self.focus_current(window, cx);
+            }
+            "close-unsaved" => {
+                self.store = None;
+                self.book.title = "Close dialog QA".into();
+                self.book.revision += 1;
+                self.request_close(window, cx);
+            }
             "scroll-edges" => {
                 self.editors[self.active].update(cx, |e, cx| {
                     e.engine = oicha_core::editor::Editor::new(RichText::plain(
@@ -363,7 +575,7 @@ impl Oicha {
                     anyhow::ensure!(this.settings_error.is_none(), "Recovered preference save retained its old error");
                     this.set_language(language, window, cx);
                     assert_eq!(serde_json::to_vec(&this.book).unwrap(), serde_json::to_vec(&original).unwrap(), "Changing interface language changed the manuscript");
-                    this.editors[this.active].read(cx).focus.focus(window);
+                    this.focus_current(window, cx);
                     Ok(())
                 })??;
                 cx.update(|window, _| crate::fonts::validate_vietnamese(window))??;
@@ -391,6 +603,44 @@ impl Oicha {
                 let dispatch = |key: &str, window: &mut Window, cx: &mut App| {
                     window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                 };
+                // dd follows real shaped rows, including when two d events
+                // arrive before the next frame. Undo must restore one edit.
+                let dd_text = format!("{}\nĐoạn sau giữ nguyên.", "Niềm tin 🌿 và ánh sáng buổi chiều. ".repeat(45));
+                cx.update(|_, cx| editor.update(cx, |e, cx| {
+                    let generation = e.engine.generation + 1;
+                    e.engine = oicha_core::editor::Editor::new(RichText::plain(dd_text.clone()));
+                    e.engine.generation = generation; e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                }))?;
+                settle_editor(&editor, cx).await?;
+                cx.update(|window, cx| { dispatch("j", window, cx); dispatch("0", window, cx); })?;
+                let dd_start = cx.update(|_, cx| editor.read(cx).engine.cursor)?;
+                cx.update(|window, cx| { dispatch("j", window, cx); dispatch("0", window, cx); })?;
+                let dd_end = cx.update(|_, cx| editor.read(cx).engine.cursor)?;
+                cx.update(|window, cx| { for key in ["k", "0", "d", "d"] { dispatch(key, window, cx); } })?;
+                let dd_expected = format!("{}{}", &dd_text[..dd_start], &dd_text[dd_end..]);
+                anyhow::ensure!(cx.update(|_, cx| { let e = &editor.read(cx).engine; e.body.text == dd_expected && e.cursor == dd_start && e.register.text == dd_text[dd_start..dd_end] })?, "dd deleted more than the active shaped row");
+                cx.update(|window, cx| dispatch("u", window, cx))?;
+                anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == dd_text)?, "Display dd was not one undo transaction");
+                for dd_tail in ["[cảnh: trong căn phòng về chiều tà]\nddddasdasd".to_owned(), "Niềm tin và ánh sáng 🌿. ".repeat(70)] {
+                    cx.update(|_, cx| editor.update(cx, |e, cx| {
+                        let generation = e.engine.generation + 1;
+                        e.engine = oicha_core::editor::Editor::new(RichText::plain(dd_tail.clone()));
+                        e.engine.generation = generation; e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                    }))?;
+                    settle_editor(&editor, cx).await?;
+                    cx.update(|window, cx| { for key in ["G", "$", "0"] { dispatch(key, window, cx); } })?;
+                    settle_editor(&editor, cx).await?;
+                    let (dd_start, dd_row_y, dd_partial) = cx.update(|_, cx| {
+                        let e = editor.read(cx); (e.engine.cursor, e.motion_probe().1.y, e.engine.cursor > e.engine.line_start(e.engine.cursor))
+                    })?;
+                    let dd_expected = format!("{}{}", &dd_tail[..dd_start], if dd_partial { "\n" } else { "" });
+                    cx.update(|window, cx| { dispatch("d", window, cx); dispatch("d", window, cx); })?;
+                    settle_editor(&editor, cx).await?;
+                    anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.body.text == dd_expected && e.engine.cursor == dd_expected.len() && (f32::from(e.motion_probe().1.y - dd_row_y)).abs() < 2. })?, "Final dd did not retain the same empty writing row");
+                    cx.update(|window, cx| dispatch("i", window, cx))?;
+                    cx.update(|window, cx| editor.update(cx, |e, cx| e.replace_text_in_range(None, "niềm tin", window, cx)))?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == format!("{dd_expected}niềm tin"))?, "Could not type immediately after final dd without Enter");
+                }
                 // A find target must bypass search/Ex shortcuts and counts,
                 // while still travelling through the real key handler.
                 cx.update(|_, cx| editor.update(cx, |e, cx| {
@@ -988,7 +1238,7 @@ impl Oicha {
                     if this.update(cx, |this, _| !this.io_busy && !this.saving && this.pending.is_none())? { break; }
                 }
                 anyhow::ensure!(this.update(cx, |this, _| this.path.as_ref() == Some(&target) && this.book.title == "Switch regression")?, "Load transition did not finish");
-                let stored_old: Manuscript = serde_json::from_slice(&std::fs::read(&path)?)?;
+                let (_, stored_old, _) = Store::open(path.clone())?;
                 anyhow::ensure!(stored_old.chapters[0].body.text.contains("EDIT_DURING_LOAD"), "Concurrent input was lost during load");
                 anyhow::ensure!(this.update(cx, |this, _| !this.book.chapters[0].body.text.contains("EDIT_DURING_LOAD"))?, "Old input leaked into the destination book");
                 let closing_path = path.with_extension("closing.oicha");
@@ -1015,24 +1265,78 @@ impl Oicha {
                 this.editors[this.active].update(cx, |e, cx| { e.scroll.set_offset(gpui::point(px(0.), px(0.))); cx.notify(); });
                 this.status = output; cx.notify();
             });
-            if let Some(gate) = close_gate { let _ = gate.send(()); }
+            if let Some(gate) = close_gate {
+                let _ = gate.send(());
+                for _ in 0..200 {
+                    cx.background_executor().timer(Duration::from_millis(25)).await;
+                    if this.update(cx, |this, _| this.close_prompt).unwrap_or(false) {
+                        let _ = this.update_in(cx, |this, window, cx| this.choose_close(CloseChoice::Save, window, cx));
+                        break;
+                    }
+                }
+            }
         }).detach();
     }
+    /// Isolated CLI fixture for the real close/save state machine.
+    pub fn start_close_smoke(
+        &mut self,
+        scenario: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.path.clone().expect("isolated close fixture path");
+        let original_title = self.book.title.clone();
+        self.book.title = "UNSAVED_CLOSE_QA".into();
+        self.book.revision += 1;
+        if scenario == "no-store" {
+            self.store = None;
+        }
+        self.request_close(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let report = path.with_extension("close-test.json");
+            let result: anyhow::Result<()> = async {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                anyhow::ensure!(this.update(cx, |this, _| this.close_prompt && !this.io_busy && !this.saving)?, "Close opened a save picker or saved before a choice");
+                cx.update(|window, cx| window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx))?;
+                cx.background_executor().timer(Duration::from_millis(180)).await;
+                anyhow::ensure!(this.update(cx, |this, _| !this.close_prompt && this.pending.is_none() && this.book.title == "UNSAVED_CLOSE_QA")?, "Default Enter did not cancel close and retain edits");
+                this.update_in(cx, |this, window, cx| {
+                    this.request_close(window, cx);
+                    this.request_close(window, cx);
+                })?;
+                anyhow::ensure!(this.update(cx, |this, _| this.close_prompt && !this.close_save_authorized)?, "Repeated X bypassed the close decision");
+                if scenario == "save-failure" {
+                    // Fail validation before the transaction; never corrupt a live database.
+                    this.update(cx, |this, _| this.book.version = u32::MAX)?;
+                    this.update_in(cx, |this, window, cx| this.choose_close(CloseChoice::Save, window, cx))?;
+                    for _ in 0..100 {
+                        cx.background_executor().timer(Duration::from_millis(25)).await;
+                        if this.update(cx, |this, _| !this.saving && !this.io_busy)? { break; }
+                    }
+                    anyhow::ensure!(this.update(cx, |this, _| this.error.is_some() && this.book.revision != this.saved_revision)?, "Save failure closed or acknowledged unsaved edits");
+                    this.update_in(cx, |this, window, cx| this.request_close(window, cx))?;
+                } else if scenario == "discard" {
+                    this.update(cx, |this, _| this.store.as_ref().unwrap().lock().unwrap().checkpoint(&this.book))??;
+                }
+                anyhow::ensure!(["save", "discard", "no-store", "save-failure"].contains(&scenario.as_str()), "Unknown close fixture scenario");
+                let expected_title = match scenario.as_str() { "save" => "UNSAVED_CLOSE_QA", _ => &original_title };
+                atomic_write(&report, &serde_json::to_vec_pretty(&serde_json::json!({"result":"PASS","scenario":scenario,"expectedTitle":expected_title,"cancelPreservedEdits":true,"noSaveBeforeChoice":true}))?)?;
+                this.update_in(cx, |this, window, cx| this.choose_close(if scenario == "save" { CloseChoice::Save } else { CloseChoice::Discard }, window, cx))?;
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                let _ = atomic_write(&report, &serde_json::to_vec_pretty(&serde_json::json!({"result":"FAIL","error":format!("{error:#}")})).unwrap());
+                let _ = this.update_in(cx, |_, window, _| window.remove_window());
+            }
+        }).detach();
+    }
+
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let language = crate::settings::Preferences::load().language;
-        let remembered = std::fs::read_to_string(data_dir().join("last-session"))
-            .ok()
-            .map(PathBuf::from);
-        let path = path.or(remembered);
-        let initial = if let Some(path) = path {
-            Store::open(path)
-        } else {
-            scratch().and_then(|(mut s, _)| {
-                let b = Manuscript::demo();
-                s.save(&b)?;
-                Ok((s, b, false))
-            })
-        };
+        let smoke = std::env::args_os()
+            .nth(1)
+            .is_some_and(|s| s == "--smoke-test");
+        let initial = crate::library::open_startup(path, &data_dir());
         let (book, store, path, recovered, error) = match initial {
             Ok((s, b, recovered)) => {
                 let p = s.path.clone();
@@ -1044,17 +1348,23 @@ impl Oicha {
                 None,
                 None,
                 false,
-                Some(ui_format!(
-                    language,
-                    "Không mở được bản thảo: {e:#}. File gốc được giữ nguyên. Hãy Mở file khác hoặc Lưu thành bản mới.",
-                    "Cannot open manuscript: {e:#}. The original file is preserved. Open another file or use Save as."
-                )),
+                Some(Notification::open_library(&e)),
             ),
         };
-        let start_words = book.words();
-        let notice = store
+        let has_project = store
             .as_ref()
-            .and_then(|store| store.lock().ok()?.recovery_warning().map(str::to_owned));
+            .is_some_and(|s| s.lock().unwrap().selected_project().is_some());
+        let projects = store
+            .as_ref()
+            .map(|s| s.lock().unwrap().projects())
+            .transpose();
+        let (projects, notice) = match projects {
+            Ok(projects) => (projects.unwrap_or_default(), None),
+            Err(error) => (
+                vec![],
+                Some(Notification::failure(NoticeKind::ProjectList, &error)),
+            ),
+        };
         let saved_revision = if recovered {
             book.revision.saturating_sub(1)
         } else {
@@ -1065,10 +1375,17 @@ impl Oicha {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 if this
                     .update_in(cx, |this, window, cx| {
-                        if this.book.revision != this.saved_revision
+                        if this.has_project
+                            && this.book.revision != this.saved_revision
                             && !this.saving
                             && !this.io_busy
-                            && this.error.is_none()
+                            && this.store.is_some()
+                            && this
+                                .error
+                                .as_ref()
+                                .is_none_or(|notice| !notice.blocks_autosave())
+                            && !this.close_prompt
+                            && !matches!(this.pending, Some(Pending::Close))
                         {
                             this.save(window, cx);
                         }
@@ -1088,6 +1405,13 @@ impl Oicha {
             update_ready: None,
             update_progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             book,
+            home: !smoke || !has_project,
+            has_project,
+            switching_project: false,
+            deleting_project: false,
+            projects,
+            project_menu: None,
+            project_menu_anchor: point(px(0.), px(0.)),
             editors: vec![],
             active: 0,
             store,
@@ -1096,6 +1420,10 @@ impl Oicha {
             saving: false,
             io_busy: false,
             pending: None,
+            close_prompt: false,
+            close_save_authorized: false,
+            close_selection: 2,
+            close_error: None,
             status: if recovered {
                 language.text("Đã phục hồi bản thảo sau lần thoát trước")
             } else {
@@ -1104,6 +1432,7 @@ impl Oicha {
             .into(),
             error,
             notice,
+            expanded_notice: None,
             recovered,
             focus_mode: false,
             help: false,
@@ -1120,7 +1449,6 @@ impl Oicha {
             family: crate::fonts::NOVEL_FAMILY.into(),
             spacing: 1.85,
             vim: true,
-            session_start_words: start_words,
             _subscriptions: vec![],
             _autosave: timer,
         };
@@ -1133,20 +1461,9 @@ impl Oicha {
                 std::fs::read_to_string(crate::settings::data_dir().join("update-result.txt"))
             {
                 this.notice = Some(if result == "OK" {
-                    language
-                        .choose(
-                            "Đã cập nhật Oicha thành công.",
-                            "Oicha was updated successfully.",
-                        )
-                        .into()
+                    Notification::new(NoticeKind::UpdateComplete)
                 } else {
-                    format!(
-                        "{} {result}",
-                        language.choose(
-                            "Không thể hoàn tất cập nhật.",
-                            "The update could not finish."
-                        )
-                    )
+                    Notification::with_details(NoticeKind::UpdateFailed, result)
                 });
                 let _ = std::fs::remove_file(crate::settings::data_dir().join("update-result.txt"));
             }
@@ -1198,7 +1515,15 @@ impl Oicha {
             self.editors.push(entity);
         }
         self.active = self.active.min(self.editors.len() - 1);
-        self.editors[self.active].read(cx).focus.focus(window);
+        self.focus_current(window, cx);
+    }
+
+    fn focus_current(&self, window: &mut Window, cx: &Context<Self>) {
+        if self.home {
+            self.modal_focus.focus(window);
+        } else {
+            self.editors[self.active].read(cx).focus.focus(window);
+        }
     }
 
     fn dirty(&mut self, cx: &mut Context<Self>) {
@@ -1208,10 +1533,7 @@ impl Oicha {
         cx.notify();
     }
     fn clipboard_unavailable(&mut self, cx: &mut Context<Self>) {
-        self.notice = Some(self.language.choose(
-            "Chưa truy cập được bảng nhớ tạm. Nội dung chưa bị cắt; hãy thử lại thao tác sao chép/cắt/dán.",
-            "The clipboard is unavailable. No text was cut; please retry copy/cut/paste.",
-        ).into());
+        self.notice = Some(Notification::new(NoticeKind::Clipboard));
         cx.notify();
     }
     fn activate_chapter(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1222,8 +1544,66 @@ impl Oicha {
     }
 
     pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_prompt
+            || (matches!(self.pending, Some(Pending::Close)) && (self.io_busy || self.saving))
+        {
+            return;
+        }
+        self.close_save_authorized = false;
         self.pending = Some(Pending::Close);
         self.drive_pending(window, cx);
+    }
+
+    fn save_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_save_authorized = true;
+        self.pending = Some(Pending::Close);
+        self.drive_pending(window, cx);
+    }
+
+    fn choose_close(&mut self, choice: CloseChoice, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.close_prompt || self.modal_closing || self.io_busy || self.saving {
+            return;
+        }
+        match choice {
+            CloseChoice::Cancel => self.close_modal(window, cx),
+            CloseChoice::Save => {
+                // Clear the modal synchronously: a delayed focus-restoration
+                // timer must not steal focus from the native Save As dialog.
+                self.begin_modal();
+                self.save_and_close(window, cx);
+            }
+            CloseChoice::Discard => {
+                let Some(store) = self.store.clone() else {
+                    window.remove_window();
+                    return;
+                };
+                self.io_busy = true;
+                self.close_error = None;
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            store
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("Storage lock poisoned"))?
+                                .discard_checkpoint()
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.io_busy = false;
+                        match result {
+                            Ok(()) => window.remove_window(),
+                            Err(error) => {
+                                this.close_error =
+                                    Some(Notification::failure(NoticeKind::Close, &error));
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     fn drive_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1238,8 +1618,18 @@ impl Oicha {
                 self.book.revision += 1;
             }
         }
-        if self.book.revision == self.saved_revision && self.store.is_some() {
+        if !self.has_project || (self.book.revision == self.saved_revision && self.store.is_some())
+        {
             self.finish_pending(window, cx);
+        } else if matches!(self.pending, Some(Pending::Close)) && !self.close_save_authorized {
+            if !self.close_prompt {
+                self.begin_modal();
+                self.close_prompt = true;
+                self.close_selection = 2;
+                self.close_error = None;
+                self.modal_focus.focus(window);
+                cx.notify();
+            }
         } else {
             self.save(window, cx);
         }
@@ -1248,6 +1638,10 @@ impl Oicha {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let language = self.language;
         if self.saving || self.io_busy {
+            return;
+        }
+        if !self.has_project {
+            self.finish_pending(window, cx);
             return;
         }
         let Some(store) = self.store.clone() else {
@@ -1265,17 +1659,30 @@ impl Oicha {
                     let mut store = store
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Storage lock poisoned"))?;
-                    store.checkpoint(&snapshot)?;
-                    store.save(&snapshot)
+                    store.save(&snapshot)?;
+                    Ok::<_, anyhow::Error>(store.projects())
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let language = this.language;
                 this.saving = false;
                 match result {
-                    Ok(()) => {
+                    Ok(projects) => {
+                        match projects {
+                            Ok(projects) => this.projects = projects,
+                            Err(error) => {
+                                this.notice =
+                                    Some(Notification::failure(NoticeKind::ProjectList, &error))
+                            }
+                        }
                         this.saved_revision = revision;
-                        this.error = None;
+                        if this
+                            .error
+                            .as_ref()
+                            .is_some_and(Notification::blocks_autosave)
+                        {
+                            this.error = None;
+                        }
                         this.recovered = false;
                         this.status = if this.book.revision == revision {
                             language.text("Đã lưu trên máy")
@@ -1286,11 +1693,7 @@ impl Oicha {
                         this.drive_pending(window, cx);
                     }
                     Err(e) => {
-                        this.error = Some(ui_format!(
-                            language,
-                            "Không lưu được: {e:#}",
-                            "Could not save: {e:#}"
-                        ));
+                        this.error = Some(Notification::failure(NoticeKind::Save, &e));
                         this.status = language
                             .text("Lưu thất bại · hãy Lưu thành file khác")
                             .into();
@@ -1326,6 +1729,7 @@ impl Oicha {
                     let _ = this.update_in(cx, |this, _, cx| {
                         this.io_busy = false;
                         this.pending = None;
+                        this.close_save_authorized = false;
                         cx.notify();
                     });
                     return;
@@ -1341,11 +1745,27 @@ impl Oicha {
                 return;
             };
             let revision = snapshot.revision;
+            let source = this
+                .update(cx, |this, _| (this.store.clone(), this.has_project))
+                .ok();
+            let Some((source, has_project)) = source else {
+                return;
+            };
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut store = Store::create(path)?;
-                    store.save(&snapshot)?;
+                    let store = if let Some(source) = source {
+                        source
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Storage lock poisoned"))?
+                            .copy_to(path, has_project.then_some(&snapshot))?
+                    } else {
+                        let mut store = Store::create(path)?;
+                        if has_project {
+                            store.save(&snapshot)?;
+                        }
+                        store
+                    };
                     remember(&store.path);
                     Ok::<_, anyhow::Error>(store)
                 })
@@ -1355,6 +1775,13 @@ impl Oicha {
                 this.io_busy = false;
                 match result {
                     Ok(store) => {
+                        match store.projects() {
+                            Ok(projects) => this.projects = projects,
+                            Err(error) => {
+                                this.notice =
+                                    Some(Notification::failure(NoticeKind::ProjectList, &error))
+                            }
+                        }
                         this.path = Some(store.path.clone());
                         this.store = Some(Arc::new(Mutex::new(store)));
                         this.saved_revision = revision;
@@ -1362,13 +1789,7 @@ impl Oicha {
                         this.status = language.text("Đã lưu bản thảo mới").into();
                         this.drive_pending(window, cx);
                     }
-                    Err(e) => {
-                        this.error = Some(ui_format!(
-                            language,
-                            "Không lưu được bản mới: {e:#}",
-                            "Could not save the new copy: {e:#}"
-                        ))
-                    }
+                    Err(e) => this.error = Some(Notification::failure(NoticeKind::SaveAs, &e)),
                 }
                 cx.notify();
             });
@@ -1377,7 +1798,6 @@ impl Oicha {
     }
 
     fn finish_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let language = self.language;
         match self.pending.take() {
             Some(Pending::Close) => window.remove_window(),
             Some(Pending::Update) => {
@@ -1388,42 +1808,40 @@ impl Oicha {
                     ) {
                         Ok(()) => window.remove_window(),
                         Err(error) => {
-                            self.update_status = UpdateStatus::Failed(format!("{error:#}"));
+                            self.update_status = UpdateStatus::Failed(Notification::failure(
+                                NoticeKind::InstallUpdate,
+                                &error,
+                            ));
                             cx.notify();
                         }
                     }
                 }
             }
             Some(Pending::New) => {
-                let result = scratch().and_then(|(mut s, _)| {
-                    let mut book = Manuscript::new();
-                    if language == Language::En {
-                        book.title = "Untitled novel".into();
-                        book.chapters[0].title = "Chapter 1".into();
-                    }
-                    s.save(&book)?;
-                    Ok((s, book))
-                });
-                match result {
-                    Ok((s, book)) => {
-                        self.path = Some(s.path.clone());
-                        remember(&s.path);
-                        self.store = Some(Arc::new(Mutex::new(s)));
-                        self.book = book;
-                        self.saved_revision = 0;
-                        self.active = 0;
-                        self.session_start_words = 0;
-                        self.error = None;
-                        self.notice = None;
-                        self.build_editors(window, cx);
-                    }
-                    Err(e) => {
-                        self.error = Some(ui_format!(
-                            language,
-                            "Không tạo được bản thảo: {e:#}",
-                            "Could not create manuscript: {e:#}"
-                        ))
-                    }
+                if self.store.is_none() {
+                    self.pending = Some(Pending::New);
+                    self.save_as(window, cx);
+                } else {
+                    self.change_project(None, window, cx);
+                }
+            }
+            Some(Pending::Home) => {
+                self.home = true;
+                self.focus_mode = false;
+                self.focus_current(window, cx);
+                cx.notify();
+            }
+            Some(Pending::Project(id)) => {
+                let current = self
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.lock().ok()?.selected_project());
+                if self.has_project && current == Some(id) {
+                    self.home = false;
+                    self.focus_current(window, cx);
+                    cx.notify();
+                } else {
+                    self.change_project(Some(id), window, cx);
                 }
             }
             Some(Pending::Open(path)) => self.load(path, window, cx),
@@ -1433,11 +1851,212 @@ impl Oicha {
     }
 
     fn new_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.io_busy {
+        if self.io_busy || self.pending.is_some() {
             return;
         }
+        self.project_menu = None;
         self.pending = Some(Pending::New);
-        self.save(window, cx);
+        self.drive_pending(window, cx);
+    }
+
+    fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.io_busy || self.pending.is_some() {
+            return;
+        }
+        self.pending = Some(Pending::Home);
+        self.drive_pending(window, cx);
+    }
+
+    fn open_project(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.io_busy || self.pending.is_some() {
+            return;
+        }
+        self.project_menu = None;
+        self.pending = Some(Pending::Project(id));
+        self.drive_pending(window, cx);
+    }
+
+    fn toggle_project_menu(
+        &mut self,
+        id: u64,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.home || self.io_busy || self.saving || self.pending.is_some() {
+            return;
+        }
+        self.project_menu = if self.project_menu == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
+        self.project_menu_anchor = position + point(px(12.), px(18.));
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_delete_project(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.home || self.io_busy || self.saving || self.pending.is_some() {
+            return;
+        }
+        let Some(project) = self.projects.iter().find(|p| p.id == id) else {
+            return;
+        };
+        let description = ui_format!(
+            self.language,
+            "Xóa toàn bộ “{}” cùng các chương và ghi chú khỏi kho này? Thao tác này không thể hoàn tác.",
+            "Delete “{}”, including its chapters and notes, from this library? This action cannot be undone.",
+            project.title
+        );
+        self.begin_modal();
+        self.confirmation = Some(Confirmation {
+            title: self.language.choose("Xóa dự án?", "Delete project?").into(),
+            description,
+            label: self.language.choose("Xóa dự án", "Delete project"),
+            action: Some(ConfirmAction::DeleteProject(id)),
+        });
+        self.modal_focus.focus(window);
+        cx.notify();
+    }
+
+    fn delete_project(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.home || self.io_busy || self.saving || self.pending.is_some() {
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let current = store.lock().unwrap().selected_project() == Some(id);
+        self.io_busy = true;
+        self.switching_project = true;
+        self.deleting_project = true;
+        self.modal_focus.focus(window);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Storage lock poisoned"))?
+                        .delete_project(id)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.io_busy = false;
+                this.switching_project = false;
+                this.deleting_project = false;
+                match result {
+                    Ok(()) => {
+                        this.projects.retain(|project| project.id != id);
+                        if current {
+                            // Remove all live editor subscriptions as well: a later
+                            // autosave must never recreate the deleted project.
+                            this.has_project = false;
+                            this.book = Manuscript::new();
+                            this.saved_revision = this.book.revision;
+                            this.active = 0;
+                            this.recovered = false;
+                            this.query.clear();
+                            this.build_editors(window, cx);
+                        }
+                        this.error = None;
+                        this.status = this
+                            .language
+                            .choose("Đã xóa dự án", "Project deleted")
+                            .into();
+                    }
+                    Err(error) => {
+                        this.error = Some(Notification::failure(NoticeKind::DeleteProject, &error))
+                    }
+                }
+                this.drive_pending(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn change_project(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.io_busy = true;
+        self.switching_project = true;
+        // Keep IME input and pointer edits out of the previous project's editor
+        // until the storage selection and the displayed document agree again.
+        self.modal_focus.focus(window);
+        let language = self.language;
+        let number = self.projects.len() + 1;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut store = store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Storage lock poisoned"))?;
+                    let (book, recovered) = if let Some(id) = id {
+                        store.select_project(id)?
+                    } else {
+                        let mut book = Manuscript::new();
+                        book.title = ui_format!(language, "Tiểu thuyết {number}", "Novel {number}");
+                        if language == Language::En {
+                            book.chapters[0].title = "Chapter 1".into();
+                        }
+                        store.new_project(&book)?;
+                        (book, false)
+                    };
+                    Ok::<_, anyhow::Error>((book, recovered))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.io_busy = false;
+                this.switching_project = false;
+                match result {
+                    Ok((book, recovered)) => {
+                        this.saved_revision = if recovered {
+                            book.revision.saturating_sub(1)
+                        } else {
+                            book.revision
+                        };
+                        this.book = book;
+                        if let Some(store) = &this.store {
+                            match store.lock().unwrap().projects() {
+                                Ok(projects) => this.projects = projects,
+                                Err(error) => {
+                                    this.notice =
+                                        Some(Notification::failure(NoticeKind::ProjectList, &error))
+                                }
+                            }
+                        }
+                        this.has_project = true;
+                        this.home = false;
+                        this.active = 0;
+                        this.recovered = recovered;
+                        this.query.clear();
+                        this.error = None;
+                        this.status = this
+                            .language
+                            .text(if recovered {
+                                "Đã phục hồi bản thảo"
+                            } else {
+                                "Đã mở bản thảo"
+                            })
+                            .into();
+                        this.build_editors(window, cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(Notification::failure(NoticeKind::OpenProject, &error));
+                        this.focus_current(window, cx);
+                    }
+                }
+                this.drive_pending(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1450,11 +2069,7 @@ impl Oicha {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(
-                language
-                    .text("Mở bản thảo .oicha, .txt hoặc .recovery")
-                    .into(),
-            ),
+            prompt: Some(language.text("Mở kho dự án .oicha").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = receiver.await;
@@ -1493,7 +2108,6 @@ impl Oicha {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let language = self.language;
         self.io_busy = true;
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -1503,42 +2117,10 @@ impl Oicha {
                         gate.recv()
                             .map_err(|error| anyhow::anyhow!("Load test barrier: {error}"))?;
                     }
-                    match path.extension().and_then(|e| e.to_str()) {
-                        Some("txt") => {
-                            anyhow::ensure!(
-                                std::fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
-                                "Text file exceeds 64 MiB"
-                            );
-                            let mut book = Manuscript::new();
-                            if language == Language::En {
-                                book.chapters[0].title = "Chapter 1".into();
-                            }
-                            book.title = path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into();
-                            book.chapters[0].body = RichText::plain(
-                                std::fs::read_to_string(&path)?
-                                    .replace("\r\n", "\n")
-                                    .replace('\r', "\n"),
-                            );
-                            let (mut store, _) = scratch()?;
-                            store.save(&book)?;
-                            Ok((store, book, false))
-                        }
-                        Some("recovery") => {
-                            let book = Store::recover_copy(&path)?;
-                            let (mut store, _) = scratch()?;
-                            store.save(&book)?;
-                            Ok((store, book, true))
-                        }
-                        _ => Store::open(path),
-                    }
+                    Store::open(path)
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let language = this.language;
                 this.io_busy = false;
                 match result {
                     Ok((store, book, recovered)) => {
@@ -1552,11 +2134,7 @@ impl Oicha {
                         this.drive_pending(window, cx);
                     }
                     Err(e) => {
-                        this.error = Some(ui_format!(
-                            language,
-                            "Không mở được: {e:#}",
-                            "Could not open: {e:#}"
-                        ));
+                        this.error = Some(Notification::open_library(&e));
                         this.drive_pending(window, cx);
                     }
                 }
@@ -1573,7 +2151,15 @@ impl Oicha {
             book,
             recovered,
         } = loaded;
-        self.notice = store.recovery_warning().map(str::to_owned);
+        self.notice = None;
+        self.projects = store.projects().unwrap_or_else(|e| {
+            self.notice = Some(Notification::failure(NoticeKind::ProjectList, &e));
+            vec![]
+        });
+        self.has_project = store.selected_project().is_some();
+        self.home = !std::env::args_os()
+            .nth(1)
+            .is_some_and(|s| s == "--smoke-test");
         self.path = Some(store.path.clone());
         remember(&store.path);
         self.store = Some(Arc::new(Mutex::new(store)));
@@ -1582,7 +2168,6 @@ impl Oicha {
         } else {
             book.revision
         };
-        self.session_start_words = book.words();
         self.book = book;
         self.active = 0;
         self.recovered = recovered;
@@ -1675,13 +2260,7 @@ impl Oicha {
                         this.status =
                             ui_format!(language, "Đã xuất: {display}", "Exported: {display}")
                     }
-                    Err(e) => {
-                        this.error = Some(ui_format!(
-                            language,
-                            "Xuất file thất bại: {e:#}",
-                            "Export failed: {e:#}"
-                        ))
-                    }
+                    Err(e) => this.error = Some(Notification::failure(NoticeKind::Export, &e)),
                 }
                 cx.notify();
             });
@@ -1692,6 +2271,11 @@ impl Oicha {
     // Each transition gets a new element ID. A delayed close can never clear a
     // newer popup, including one opened by a Vim command during submission.
     fn begin_modal(&mut self) {
+        self.project_menu = None;
+        if self.close_prompt {
+            self.pending = None;
+            self.close_save_authorized = false;
+        }
         self.modal_epoch += 1;
         self.modal_started = Instant::now();
         self.modal_closing = false;
@@ -1700,9 +2284,18 @@ impl Oicha {
         self.help = false;
         self.confirmation = None;
         self.settings = false;
+        self.close_prompt = false;
     }
 
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_prompt {
+            if self.io_busy || self.saving {
+                return;
+            }
+            self.pending = None;
+            self.close_save_authorized = false;
+            self.close_error = None;
+        }
         if self.modal_closing {
             return;
         }
@@ -1724,8 +2317,9 @@ impl Oicha {
                 this.help = false;
                 this.confirmation = None;
                 this.settings = false;
+                this.close_prompt = false;
                 this.modal_closing = false;
-                this.editors[this.active].read(cx).focus.focus(window);
+                this.focus_current(window, cx);
                 cx.notify();
             });
         })
@@ -1769,10 +2363,6 @@ impl Oicha {
                     .map(|c| c.synopsis.clone())
                     .unwrap_or_default(),
             ),
-            PromptKind::Goal => (
-                language.text("Mục tiêu từ mỗi phiên viết"),
-                self.book.daily_goal.to_string(),
-            ),
             PromptKind::Search => (language.text("Tìm trong chương"), self.query.clone()),
             PromptKind::Command => (language.text("Lệnh Vim"), String::new()),
         };
@@ -1805,7 +2395,6 @@ impl Oicha {
         self.close_modal(window, cx);
     }
     fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let language = self.language;
         if self.modal_closing {
             return;
         }
@@ -1840,19 +2429,6 @@ impl Oicha {
                     self.dirty(cx);
                 }
             }
-            PromptKind::Goal => match value.trim().parse::<usize>() {
-                Ok(goal) if (1..=100_000).contains(&goal) => {
-                    self.book.daily_goal = goal;
-                    self.dirty(cx);
-                }
-                _ => {
-                    self.error = Some(
-                        language
-                            .text("Mục tiêu phải là số từ 1 đến 100.000.")
-                            .into(),
-                    )
-                }
-            },
             PromptKind::Search => {
                 self.query = value;
                 self.find_next(false, cx);
@@ -1865,20 +2441,15 @@ impl Oicha {
         cx.notify();
     }
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let language = self.language;
         match command {
             "w" => self.save(window, cx),
             "wa" | "saveas" => self.save_as(window, cx),
-            "wq" | "x" => self.request_close(window, cx),
+            "wq" | "x" => self.save_and_close(window, cx),
             "q" => {
                 if self.book.revision == self.saved_revision {
                     self.request_close(window, cx);
                 } else {
-                    self.error = Some(
-                        language
-                            .text("Bản thảo chưa lưu. Dùng :wq để lưu và đóng.")
-                            .into(),
-                    );
+                    self.error = Some(Notification::new(NoticeKind::Unsaved));
                 }
             }
             "new" => self.new_book(window, cx),
@@ -1904,10 +2475,9 @@ impl Oicha {
                         e.reveal_cursor(cx);
                     });
                 } else {
-                    self.error = Some(ui_format!(
-                        language,
-                        "Chưa hỗ trợ lệnh :{command}. Nhấn F1 để xem các lệnh có sẵn.",
-                        "Command :{command} is not supported. Press F1 to see available commands."
+                    self.error = Some(Notification::with_details(
+                        NoticeKind::UnsupportedCommand,
+                        format!(":{command}"),
                     ));
                 }
             }
@@ -2004,15 +2574,15 @@ impl Oicha {
     fn delete_chapter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let language = self.language;
         if self.book.chapters.len() == 1 {
-            self.error = Some(language.text("Bản thảo cần ít nhất một chương.").into());
+            self.error = Some(Notification::new(NoticeKind::LastChapter));
             return;
         }
         let chapter = &self.book.chapters[self.active];
         let id = chapter.id;
         let description = ui_format!(
             language,
-            "“{}” sẽ bị xóa khỏi bản thảo. File .bak giữ phiên bản lưu trước đó.",
-            "“{}” will be deleted from the manuscript. The .bak file keeps the previous saved version.",
+            "“{}” sẽ bị xóa khỏi dự án này. Thao tác này không thể hoàn tác.",
+            "“{}” will be deleted from this project. This action cannot be undone.",
             chapter.title
         );
         self.begin_modal();
@@ -2028,6 +2598,13 @@ impl Oicha {
 
     fn accept_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_closing {
+            return;
+        }
+        if matches!(
+            self.confirmation.as_ref().and_then(|c| c.action.as_ref()),
+            Some(ConfirmAction::DeleteProject(_))
+        ) && (self.io_busy || self.saving)
+        {
             return;
         }
         let action = self.confirmation.as_mut().and_then(|c| c.action.take());
@@ -2046,6 +2623,7 @@ impl Oicha {
             Some(ConfirmAction::Export { book, path, text }) => {
                 self.write_export(*book, path, text, window, cx)
             }
+            Some(ConfirmAction::DeleteProject(id)) => self.delete_project(id, window, cx),
             None => {}
         }
     }
@@ -2053,6 +2631,37 @@ impl Oicha {
     fn keyboard(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let ctrl = k.modifiers.control || k.modifiers.platform;
+        if k.modifiers.alt && k.key == "f4" {
+            self.request_close(window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if self.close_prompt {
+            if !self.modal_closing && !self.io_busy && !self.saving {
+                match k.key.as_str() {
+                    "escape" => self.choose_close(CloseChoice::Cancel, window, cx),
+                    "tab" => {
+                        self.close_selection =
+                            (self.close_selection + if k.modifiers.shift { 2 } else { 1 }) % 3;
+                        cx.notify();
+                    }
+                    "enter" => self.choose_close(
+                        match self.close_selection {
+                            0 => CloseChoice::Save,
+                            1 => CloseChoice::Discard,
+                            _ => CloseChoice::Cancel,
+                        },
+                        window,
+                        cx,
+                    ),
+                    _ => {}
+                }
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.modal_closing || self.help || self.settings || self.confirmation.is_some() {
             if !self.modal_closing {
                 match k.key.as_str() {
@@ -2090,6 +2699,37 @@ impl Oicha {
             // replace a manuscript underneath a modal.
             return;
         }
+        if self.switching_project {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if self.home {
+            if let Some(id) = self.project_menu {
+                match k.key.as_str() {
+                    "escape" | "tab" => {
+                        self.project_menu = None;
+                        cx.notify();
+                    }
+                    "enter" => self.confirm_delete_project(id, window, cx),
+                    _ => {}
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            match k.key.as_str() {
+                "n" if ctrl => self.new_book(window, cx),
+                "o" if ctrl => self.open(window, cx),
+                "s" if ctrl && k.modifiers.shift => self.save_as(window, cx),
+                "s" if ctrl => self.save(window, cx),
+                "f1" => self.toggle_help(window, cx),
+                _ => return,
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         match k.key.as_str() {
             "s" if ctrl && k.modifiers.shift => self.save_as(window, cx),
             "s" if ctrl => self.save(window, cx),
@@ -2117,14 +2757,180 @@ impl Oicha {
     fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
         div()
             .id(id)
-            .px(px(12.))
-            .py(px(7.))
+            .px(px(9.))
+            .py(px(5.))
             .rounded(px(6.))
             .text_size(px(12.))
             .cursor_pointer()
             .text_color(rgb(INK))
             .hover(|s| s.bg(rgb(0xeceee7)).text_color(rgb(INK)))
             .child(label.into())
+    }
+
+    fn notification_card(
+        &self,
+        notice: &Notification,
+        slot: NoticeSlot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let language = self.language;
+        let (title, body) = notice.copy(language);
+        let (background, accent, symbol) = match notice.tone() {
+            Tone::Error => (0xfcf1ee, 0x9b4535, "!"),
+            Tone::Warning => (0xf8f4e9, 0x836527, "!"),
+            Tone::Success => (0xedf4ed, GREEN, "✓"),
+            Tone::Info => (0xeff3f5, 0x496879, "i"),
+        };
+        let expanded = self
+            .expanded_notice
+            .as_ref()
+            .is_some_and(|(current_slot, current)| *current_slot == slot && current == notice);
+        let id = match slot {
+            NoticeSlot::Main => "main-notification",
+            NoticeSlot::Settings => "settings-notification",
+            NoticeSlot::Close => "close-notification",
+            NoticeSlot::Update => "update-notification",
+        };
+        div()
+            .id(id)
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .p(px(12.))
+            .rounded(px(8.))
+            .bg(rgb(background))
+            .text_color(rgb(INK))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .rounded_full()
+                            .bg(rgb(accent))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(12.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(symbol),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(div().text_size(px(12.)).line_height(px(18.)).child(body)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .when(notice.details.is_some(), |d| {
+                                let notice = notice.clone();
+                                d.child(
+                                    Self::button(
+                                        (id, 0usize),
+                                        language.choose(
+                                            if expanded {
+                                                "Ẩn chi tiết"
+                                            } else {
+                                                "Chi tiết"
+                                            },
+                                            if expanded { "Hide details" } else { "Details" },
+                                        ),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.expanded_notice = if expanded {
+                                                None
+                                            } else {
+                                                Some((slot, notice.clone()))
+                                            };
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
+                            .when(slot == NoticeSlot::Main, |d| {
+                                d.child(
+                                    Self::button("dismiss-error", language.text("Đóng")).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            // Dismissing the visible error must not lose a queued notice.
+                                            if this.error.is_some() {
+                                                this.error = None;
+                                            } else {
+                                                this.notice = None;
+                                            }
+                                            this.expanded_notice = None;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                )
+                            }),
+                    ),
+            )
+            .when(expanded, |d| {
+                d.child(
+                    div()
+                        .ml(px(30.))
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                    language.choose(
+                                        "Chi tiết kỹ thuật · nội dung gốc",
+                                        "Technical details · original message",
+                                    ),
+                                ))
+                                .child(
+                                    Self::button((id, 1usize), language.choose("Sao chép", "Copy"))
+                                        .on_click(cx.listener({
+                                            let details =
+                                                notice.details.clone().unwrap_or_default();
+                                            move |_, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    details.clone(),
+                                                ));
+                                            }
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id((id, 2usize))
+                                .max_h(px(96.))
+                                .overflow_y_scroll()
+                                .p(px(8.))
+                                .rounded(px(5.))
+                                .bg(rgb(0xffffff))
+                                .text_size(px(11.))
+                                .line_height(px(17.))
+                                .child(notice.details.clone().unwrap_or_default()),
+                        ),
+                )
+            })
     }
 
     fn caption_button(id: &'static str, area: WindowControlArea, maximized: bool) -> Stateful<Div> {
@@ -2226,8 +3032,6 @@ impl Oicha {
         div()
             .id("app-titlebar")
             .h(px(TITLEBAR_HEIGHT))
-            .pt(px(4.))
-            .px(px(4.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -2259,11 +3063,16 @@ impl Oicha {
                             .min_w_0()
                             .text_size(px(12.))
                             .truncate()
-                            .child(self.book.title.clone()),
+                            .child(if self.home {
+                                self.language.choose("Trang chủ", "Home").to_owned()
+                            } else {
+                                self.book.title.clone()
+                            }),
                     )
-                    .when(self.book.revision != self.saved_revision, |d| {
-                        d.child(div().text_size(px(10.)).text_color(rgb(GREEN)).child("●"))
-                    }),
+                    .when(
+                        self.has_project && self.book.revision != self.saved_revision,
+                        |d| d.child(div().text_size(px(10.)).text_color(rgb(GREEN)).child("●")),
+                    ),
             )
             .child(
                 Self::button(
@@ -2277,6 +3086,9 @@ impl Oicha {
                 )
                 .mr(px(12.))
                 .on_click(cx.listener(|this, _, window, cx| {
+                    if this.close_prompt || this.switching_project {
+                        return;
+                    }
                     this.begin_modal();
                     this.settings = true;
                     this.editors[this.active].update(cx, |e, _| e.engine.finish_group());
@@ -2355,7 +3167,7 @@ impl Oicha {
                     this.update_ready = Some(ready);
                     this.update_status = UpdateStatus::Ready;
                     let path = this.path.clone().unwrap();
-                    let original = std::fs::read(&path).unwrap();
+                    let original = this.book.version;
                     this.editors[this.active].update(cx, |e, cx| {
                         e.engine.move_to(e.engine.body.text.len(), false);
                         e.engine
@@ -2364,10 +3176,12 @@ impl Oicha {
                     });
                     (path, original)
                 })?;
-                // A concurrent external edit must block the updater at the save
-                // gate. Restore the fixture, then retry the exact same update.
-                atomic_write(&path, b"external edit must block update")?;
-                this.update_in(cx, |this, window, cx| this.install_update(window, cx))?;
+                // Fail validation before a transaction. Never replace or alter
+                // the bytes of a live database to simulate a failed save.
+                this.update_in(cx, |this, window, cx| {
+                    this.book.version = 0;
+                    this.install_update(window, cx);
+                })?;
                 for _ in 0..100 {
                     cx.background_executor()
                         .timer(Duration::from_millis(50))
@@ -2386,12 +3200,12 @@ impl Oicha {
                     &path.with_extension("update-save-gate.txt"),
                     b"PASS: failed save kept window and pending update open",
                 )?;
-                atomic_write(&path, &original)?;
                 let loading = path.with_extension("update-target.oicha");
                 let mut target_store = Store::create(loading.clone())?;
                 target_store.save(&Manuscript::new())?;
                 drop(target_store);
                 this.update_in(cx, |this, window, cx| {
+                    this.book.version = original;
                     this.error = None;
                     this.load(loading, window, cx);
                     this.install_update(window, cx);
@@ -2407,7 +3221,7 @@ impl Oicha {
                             format!("{error:#}").as_bytes(),
                         );
                     }
-                    this.error = Some(format!("Update QA: {error:#}"));
+                    this.error = Some(Notification::failure(NoticeKind::UpdateFailed, &error));
                     cx.notify();
                 });
             }
@@ -2422,11 +3236,7 @@ impl Oicha {
             return;
         }
         if let Err(error) = (Preferences { language }).save() {
-            self.settings_error = Some(format!(
-                "{} {error:#}",
-                self.language
-                    .choose("Không lưu được cài đặt:", "Could not save settings:")
-            ));
+            self.settings_error = Some(Notification::failure(NoticeKind::Settings, &error));
             cx.notify();
             return;
         }
@@ -2477,7 +3287,12 @@ impl Oicha {
                         this.update_available = None;
                         this.update_status = UpdateStatus::Current;
                     }
-                    Err(error) => this.update_status = UpdateStatus::Failed(format!("{error:#}")),
+                    Err(error) => {
+                        this.update_status = UpdateStatus::Failed(Notification::failure(
+                            NoticeKind::CheckUpdate,
+                            &error,
+                        ))
+                    }
                 }
                 cx.notify();
             });
@@ -2522,7 +3337,12 @@ impl Oicha {
                         this.update_ready = Some(update);
                         this.update_status = UpdateStatus::Ready;
                     }
-                    Err(error) => this.update_status = UpdateStatus::Failed(format!("{error:#}")),
+                    Err(error) => {
+                        this.update_status = UpdateStatus::Failed(Notification::failure(
+                            NoticeKind::DownloadUpdate,
+                            &error,
+                        ))
+                    }
                 }
                 cx.notify();
             });
@@ -2560,7 +3380,8 @@ impl Oicha {
             );
             Ok(())
         }) {
-            self.update_status = UpdateStatus::Failed(format!("{error:#}"));
+            self.update_status =
+                UpdateStatus::Failed(Notification::failure(NoticeKind::InstallUpdate, &error));
             cx.notify();
             return;
         }
@@ -2607,13 +3428,7 @@ impl Oicha {
                     "Update verified. Your manuscript will be saved before restarting.",
                 )
                 .into(),
-            UpdateStatus::Failed(error) => format!(
-                "{}\n{error}",
-                l.choose(
-                    "Không thể cập nhật. Bạn có thể thử lại.",
-                    "Could not update. You can try again."
-                )
-            ),
+            UpdateStatus::Failed(_) => String::new(),
         };
         let busy = matches!(
             self.update_status,
@@ -2670,7 +3485,7 @@ impl Oicha {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(0x9b4b3e))
-                        .child(error.clone()),
+                        .child(self.notification_card(error, NoticeSlot::Settings, cx)),
                 )
             })
             .child(
@@ -2681,7 +3496,16 @@ impl Oicha {
                     .text_size(px(14.))
                     .child(format!("Oicha {}", env!("CARGO_PKG_VERSION"))),
             )
-            .child(div().text_size(px(12.)).line_height(px(20.)).child(message))
+            .when(!message.is_empty(), |d| {
+                d.child(div().text_size(px(12.)).line_height(px(20.)).child(message))
+            })
+            .when_some(
+                match &self.update_status {
+                    UpdateStatus::Failed(notice) => Some(notice),
+                    _ => None,
+                },
+                |d, notice| d.child(self.notification_card(notice, NoticeSlot::Update, cx)),
+            )
             .when(self.update_available.is_some(), |d| {
                 d.child(
                     div()
@@ -2746,10 +3570,126 @@ impl Oicha {
         self.modal_shell(card, cx)
     }
 
+    fn home_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        let filename = self
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| language.choose("Chưa mở kho", "No library open").into());
+        div().id("home").track_focus(&self.modal_focus).flex_1().min_h_0().overflow_y_scroll()
+            .px(px(64.)).py(px(44.)).bg(rgb(0xf2f4ee))
+            .child(div().w_full().max_w(px(920.)).mx_auto()
+                .child(div().flex().items_center().justify_between().mb(px(12.))
+                    .child(div().font_family(crate::fonts::NOVEL_FAMILY).text_size(px(30.)).child(language.choose("Dự án của bạn", "Your projects")))
+                    .child(Self::button("home-new-project", language.choose("+ Dự án mới", "+ New project"))
+                        .px(px(16.)).py(px(9.)).bg(rgb(GREEN)).text_color(rgb(0xffffff))
+                        .on_click(cx.listener(|this, _, window, cx| this.new_book(window, cx)))))
+                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).mb(px(28.)).child(filename))
+                .when(self.projects.is_empty(), |d| d.child(
+                    div().p(px(40.)).rounded(px(12.)).border_1().border_color(rgb(BORDER)).bg(rgb(0xfdfefb))
+                        .child(div().text_size(px(18.)).mb(px(8.)).child(if self.store.is_some() { language.choose("Bắt đầu tiểu thuyết đầu tiên", "Start your first novel") } else { language.choose("Chưa mở kho dự án", "No library open") }))
+                        .child(div().text_color(rgb(MUTED)).child(if self.store.is_some() { language.choose("Tạo một dự án mới. Các dự án của bạn cùng nằm trong file .oicha này.", "Create a project. All your projects live together in this .oicha file.") } else { language.choose("Chọn Mở kho để mở một file .oicha, hoặc Dự án mới để tạo kho mới.", "Choose Open library to open an .oicha file, or New project to create a new library.") }))
+                ))
+                .children(self.projects.iter().map(|project| {
+                    let id = project.id;
+                    div().id(("project", id)).mb(px(10.)).px(px(24.)).py(px(20.)).rounded(px(10.))
+                        .border_1().border_color(rgb(BORDER)).bg(rgb(0xfdfefb)).cursor_pointer()
+                        .hover(|s| s.bg(rgb(0xeaf0e5)).border_color(rgb(0xc9d6c5)))
+                        .flex().items_center().justify_between().gap(px(20.))
+                        .child(div().flex_1().min_w_0()
+                            .child(div().truncate().font_weight(FontWeight::SEMIBOLD).text_size(px(18.)).child(project.title.clone()))
+                            .when(!project.author.is_empty(), |d| d.child(div().mt(px(4.)).text_color(rgb(MUTED)).child(project.author.clone())))
+                            .child(div().mt(px(9.)).text_size(px(12.)).text_color(rgb(MUTED)).child(ui_format!(language, "{} chương · {} từ", "{} chapters · {} words", project.chapters, project.words))))
+                        .child(Self::button(("project-more", id), "⋯")
+                            .w(px(32.)).h(px(32.)).p(px(0.)).text_size(px(23.))
+                            .flex().items_center().justify_center().text_color(rgb(MUTED))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_project_menu(id, event.position(), window, cx);
+                            })))
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_project(id, window, cx)))
+                })))
+    }
+
+    fn project_menu_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = self.project_menu.unwrap();
+        // The menu lives outside the scrolling list, so even the last row's
+        // actions stay visible and hit testing cannot open the card underneath.
+        div()
+            .id("project-menu-dismiss")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.project_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.project_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, _, window, cx| {
+                this.project_menu = None;
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                anchored()
+                    .position(self.project_menu_anchor)
+                    .anchor(Corner::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .id("project-actions-menu")
+                            .w(px(180.))
+                            .p(px(5.))
+                            .rounded(px(9.))
+                            .bg(rgb(0xfdfefa))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .occlude()
+                            .shadow(vec![BoxShadow {
+                                color: rgba(0x122b2226).into(),
+                                offset: point(px(0.), px(5.)),
+                                blur_radius: px(18.),
+                                spread_radius: px(0.),
+                            }])
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Self::button(
+                                    "delete-project",
+                                    self.language.choose("Xóa dự án", "Delete project"),
+                                )
+                                .w_full()
+                                .text_color(rgb(0x9c4c40))
+                                .py(px(9.))
+                                .bg(rgb(0xf9efea))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.confirm_delete_project(id, window, cx);
+                                    },
+                                )),
+                            )
+                            .with_animation(
+                                ("project-actions-appear", id),
+                                Animation::new(Duration::from_millis(100)),
+                                |d, t| d.opacity(ease_out_quint()(t)),
+                            ),
+                    ),
+            )
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
-        let session_words = self.book.words().saturating_sub(self.session_start_words);
-        let goal = self.book.daily_goal.max(1);
         div()
             .w(px(248.))
             .flex_shrink_0()
@@ -2761,29 +3701,8 @@ impl Oicha {
             .border_color(rgb(BORDER))
             .child(
                 div()
-                    .px(px(22.))
-                    .py(px(24.))
-                    .child(
-                        div()
-                            .font_family(crate::fonts::NOVEL_FAMILY)
-                            .text_size(px(23.))
-                            .text_color(rgb(GREEN))
-                            .child("oicha."),
-                    )
-                    .child(
-                        div()
-                            .mt(px(3.))
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED))
-                            .child(language.text("MỖI CÂU CHỮ, MỘT THẾ GIỚI")),
-                    ),
-            )
-            .child(
-                div()
                     .px(px(18.))
                     .py(px(18.))
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
                     .child(
                         div()
                             .text_size(px(10.))
@@ -2913,48 +3832,6 @@ impl Oicha {
                                 this.activate_chapter(i, window, cx)
                             }))
                     })),
-            )
-            .child(
-                div()
-                    .p(px(18.))
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .child(language.text("PHIÊN VIẾT NÀY"))
-                            .child(ui_format!(
-                                language,
-                                "{} / {} từ",
-                                "{} / {} words",
-                                session_words,
-                                goal
-                            )),
-                    )
-                    .child(
-                        div()
-                            .h(px(4.))
-                            .mt(px(12.))
-                            .rounded(px(2.))
-                            .bg(rgb(0xe4e8dc))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative((session_words as f32 / goal as f32).min(1.)))
-                                    .bg(rgb(0x79916c))
-                                    .rounded(px(2.)),
-                            ),
-                    )
-                    .child(
-                        Self::button("goal", language.text("Đặt mục tiêu"))
-                            .mt(px(7.))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_prompt(PromptKind::Goal, window, cx)
-                            })),
-                    ),
             )
     }
 
@@ -3222,23 +4099,6 @@ impl Oicha {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .mt(px(42.))
-                    .p(px(14.))
-                    .rounded(px(6.))
-                    .bg(rgb(0xeef1e7))
-                    .child(
-                        div()
-                            .font_family(crate::fonts::NOVEL_FAMILY)
-                            .text_size(px(13.))
-                            .line_height(px(23.))
-                            .text_color(rgb(0x737d67))
-                            .child(language.text(
-                                "“Cứ viết. Một trang chưa hoàn hảo vẫn hơn một trang trắng.”",
-                            )),
-                    ),
-            )
     }
 
     fn modal_button(
@@ -3334,7 +4194,10 @@ impl Oicha {
                     ),
             )
             .child(
-                card.relative()
+                card.id("modal-card-scroll")
+                    .max_h(relative(1.))
+                    .overflow_y_scroll()
+                    .relative()
                     .occlude()
                     .rounded(px(20.))
                     .bg(rgb(0xfdfefa))
@@ -3389,11 +4252,6 @@ impl Oicha {
                 language.text("GHI CHÚ"),
                 language.text("Giữ ý tưởng, tình tiết và những điều cần nhớ ở đây."),
                 language.text("Lưu ghi chú"),
-            ),
-            PromptKind::Goal => (
-                language.text("NHỊP VIẾT"),
-                language.text("Chọn mục tiêu từ 1 đến 100.000 từ cho mỗi phiên viết."),
-                language.text("Lưu mục tiêu"),
             ),
             PromptKind::Search => (
                 language.text("TÌM KIẾM"),
@@ -3550,6 +4408,35 @@ impl Oicha {
         self.modal_shell(card, cx)
     }
 
+    fn close_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        let busy = self.io_busy || self.saving;
+        let card = div().w(px(520.)).p(px(30.)).flex().flex_col().gap(px(22.))
+            .child(Self::modal_heading(
+                language.choose("Lưu trước khi đóng?", "Save before closing?").into(),
+                language.choose("Bạn có thay đổi chưa lưu trong bản thảo này.", "This manuscript has unsaved changes."),
+                "OICHA",
+            ))
+            .child(div().text_size(px(14.)).text_color(rgb(INK)).child(self.book.title.clone()))
+            .child(div().text_size(px(12.)).line_height(px(20.)).text_color(rgb(MUTED)).child(
+                language.choose("Chọn Không lưu để bỏ các thay đổi chưa lưu. Bản đã lưu trước đó được giữ nguyên.", "Choose Don't Save to discard unsaved changes. Your previously saved manuscript is kept.")
+            ))
+            .when_some(self.close_error.as_ref(), |d, error| d.child(self.notification_card(error, NoticeSlot::Close, cx)))
+            .child(div().flex().justify_end().gap(px(10.))
+                .child(Self::modal_button("close-cancel", language.text("Hủy"), false, false)
+                    .when(self.close_selection == 2, |d| d.border_color(rgb(GREEN)))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_close(CloseChoice::Cancel, window, cx))))
+                .child(Self::modal_button("close-discard", language.choose("Không lưu", "Don't Save"), false, false)
+                    .when(self.close_selection == 1, |d| d.border_color(rgb(GREEN)))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_close(CloseChoice::Discard, window, cx))))
+                .child(Self::modal_button("close-save", language.text("Lưu"), true, false)
+                    .when(self.close_selection == 0, |d| d.border_color(rgb(INK)).border_2())
+                    .when(busy, |d| d.opacity(0.55))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_close(CloseChoice::Save, window, cx))))
+            );
+        self.modal_shell(card, cx)
+    }
+
     fn help_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
         let rows = [
@@ -3583,7 +4470,11 @@ impl Oicha {
                 language.text("Visual / Visual Line · xóa / sao chép / thay"),
             ),
             (
-                "dd · yy · cc · 3dw",
+                "dd · 3dd",
+                language.text("Xóa hàng hiển thị · giữ hàng trống ở cuối bản thảo"),
+            ),
+            (
+                "yy · cc · 3dw",
                 language.text("Thao tác dòng và lệnh có số lần lặp"),
             ),
             (
@@ -3645,12 +4536,16 @@ impl Render for Oicha {
         let pending = editor.read(cx).engine.pending();
         window.set_window_title(&format!(
             "{}{} · Oicha",
-            if self.saved_revision != self.book.revision {
+            if self.has_project && self.saved_revision != self.book.revision {
                 "● "
             } else {
                 ""
             },
-            self.book.title
+            if self.home {
+                language.choose("Trang chủ", "Home")
+            } else {
+                &self.book.title
+            }
         ));
         div()
             .relative()
@@ -3665,12 +4560,12 @@ impl Render for Oicha {
             .child(self.titlebar(window, cx))
             .child(
                 div()
-                    .h(px(50.))
+                    .h(px(38.))
                     .flex_shrink_0()
                     .flex()
                     .justify_between()
                     .items_center()
-                    .px(px(20.))
+                    .px(px(10.))
                     .border_b_1()
                     .border_color(rgb(BORDER))
                     .child(
@@ -3678,15 +4573,30 @@ impl Render for Oicha {
                             .flex()
                             .items_center()
                             .gap(px(3.))
+                            .when(!self.home, |d| {
+                                d.child(
+                                    Self::button("home", language.choose("‹ Trang chủ", "‹ Home"))
+                                        .text_color(rgb(GREEN))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.go_home(window, cx)
+                                        })),
+                                )
+                                .child(div().w(px(1.)).h(px(16.)).mx(px(5.)).bg(rgb(BORDER)))
+                            })
                             .child(
-                                Self::button("new-book", language.text("Bản thảo mới")).on_click(
+                                Self::button(
+                                    "new-book",
+                                    language.choose("+ Dự án mới", "+ New project"),
+                                )
+                                .on_click(
                                     cx.listener(|this, _, window, cx| this.new_book(window, cx)),
                                 ),
                             )
                             .child(
-                                Self::button("open", language.text("Mở")).on_click(
-                                    cx.listener(|this, _, window, cx| this.open(window, cx)),
-                                ),
+                                Self::button("open", language.choose("Mở kho", "Open library"))
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.open(window, cx)),
+                                    ),
                             )
                             .child(
                                 Self::button("save", language.text("Lưu")).on_click(
@@ -3694,135 +4604,155 @@ impl Render for Oicha {
                                 ),
                             )
                             .child(
-                                Self::button("save-as", language.text("Lưu thành…")).on_click(
+                                Self::button(
+                                    "save-as",
+                                    language.choose("Lưu kho thành…", "Save library as…"),
+                                )
+                                .on_click(
                                     cx.listener(|this, _, window, cx| this.save_as(window, cx)),
                                 ),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(Self::button("find", language.text("Tìm kiếm")).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.show_prompt(PromptKind::Search, window, cx)
-                                }),
-                            ))
-                            .child(Self::button("help", language.text("Phím tắt")).on_click(
-                                cx.listener(|this, _, window, cx| this.toggle_help(window, cx)),
-                            ))
-                            .child(Self::button("export-txt", "TXT").on_click(
-                                cx.listener(|this, _, window, cx| this.export(true, window, cx)),
-                            ))
-                            .child(
-                                Self::button("export", language.text("Xuất DOCX  ↗"))
-                                    .bg(rgb(GREEN))
-                                    .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.export(false, window, cx)
-                                    })),
-                            ),
-                    ),
+                    .when(!self.home, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(Self::button("find", language.text("Tìm kiếm")).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.show_prompt(PromptKind::Search, window, cx)
+                                    }),
+                                ))
+                                .child(Self::button("help", language.text("Phím tắt")).on_click(
+                                    cx.listener(|this, _, window, cx| this.toggle_help(window, cx)),
+                                ))
+                                .child(Self::button("export-txt", "TXT").on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.export(true, window, cx)
+                                    }),
+                                ))
+                                .child(
+                                    Self::button("export", language.text("Xuất DOCX  ↗"))
+                                        .bg(rgb(GREEN))
+                                        .text_color(rgb(0xffffff))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.export(false, window, cx)
+                                        })),
+                                ),
+                        )
+                    }),
             )
-            .when(self.error.is_some() || self.notice.is_some(), |d| {
+            .when_some(self.error.as_ref().or(self.notice.as_ref()), |d, notice| {
                 d.child(
                     div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .px(px(20.))
-                        .py(px(10.))
-                        .bg(rgb(0xfbece5))
-                        .text_size(px(12.))
-                        .text_color(rgb(0x97503c))
-                        .child(
-                            self.error
-                                .clone()
-                                .or_else(|| self.notice.clone())
-                                .unwrap_or_default(),
-                        )
-                        .child(
-                            Self::button("dismiss-error", language.text("Đóng")).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    this.notice = None;
-                                    cx.notify();
-                                }),
-                            ),
-                        ),
+                        .flex_shrink_0()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .child(self.notification_card(notice, NoticeSlot::Main, cx)),
                 )
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .when(!self.focus_mode, |d| d.child(self.sidebar(cx)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(self.toolbar(cx))
-                            .child(self.editors[self.active].clone()),
-                    )
-                    .when(!self.focus_mode, |d| d.child(self.inspector(cx))),
-            )
-            .child(
-                div()
-                    .h(px(32.))
-                    .flex_shrink_0()
-                    .px(px(16.))
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(rgb(0xf8faf4))
-                    .text_size(px(10.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .child(
-                                div()
-                                    .px(px(7.))
-                                    .py(px(3.))
-                                    .rounded(px(3.))
-                                    .bg(rgb(GREEN))
-                                    .text_color(rgb(0xffffff))
-                                    .child(if self.vim {
-                                        mode
-                                    } else {
-                                        language.text("SOẠN THẢO")
-                                    }),
-                            )
-                            .child(div().text_color(rgb(MUTED)).child(ui_format!(
-                                language,
-                                "Dòng {} · Cột {}  {}",
-                                "Line {} · Column {}  {}",
-                                position.0,
-                                position.1,
-                                pending
-                            )))
-                            .child(div().text_color(rgb(MUTED)).child(self.status.clone())),
-                    )
-                    .child(div().text_color(rgb(MUTED)).child(ui_format!(
-                        language,
-                        "{} từ  ·  UTF-8  ·  GPUI",
-                        "{} words  ·  UTF-8  ·  GPUI",
-                        self.book.words()
-                    ))),
-            )
+            .when(self.home, |d| d.child(self.home_view(cx)))
+            .when(!self.home, |d| {
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .when(!self.focus_mode, |d| d.child(self.sidebar(cx)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .child(self.toolbar(cx))
+                                .child(self.editors[self.active].clone()),
+                        )
+                        .when(!self.focus_mode, |d| d.child(self.inspector(cx))),
+                )
+            })
+            .when(!self.home, |d| {
+                d.child(
+                    div()
+                        .h(px(32.))
+                        .flex_shrink_0()
+                        .px(px(16.))
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .bg(rgb(0xf8faf4))
+                        .text_size(px(10.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .px(px(7.))
+                                        .py(px(3.))
+                                        .rounded(px(3.))
+                                        .bg(rgb(GREEN))
+                                        .text_color(rgb(0xffffff))
+                                        .child(if self.vim {
+                                            mode
+                                        } else {
+                                            language.text("SOẠN THẢO")
+                                        }),
+                                )
+                                .child(div().text_color(rgb(MUTED)).child(ui_format!(
+                                    language,
+                                    "Dòng {} · Cột {}  {}",
+                                    "Line {} · Column {}  {}",
+                                    position.0,
+                                    position.1,
+                                    pending
+                                )))
+                                .child(div().text_color(rgb(MUTED)).child(self.status.clone())),
+                        )
+                        .child(div().text_color(rgb(MUTED)).child(ui_format!(
+                            language,
+                            "{} từ  ·  UTF-8  ·  GPUI",
+                            "{} words  ·  UTF-8  ·  GPUI",
+                            self.book.words()
+                        ))),
+                )
+            })
+            .when(self.switching_project, |d| {
+                d.child(
+                    div()
+                        .id("project-transition")
+                        .absolute()
+                        .top(px(TITLEBAR_HEIGHT))
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .track_focus(&self.modal_focus)
+                        .bg(rgba(0xf9faf5cc))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(if self.deleting_project {
+                            language.choose("Đang xóa dự án…", "Deleting project…")
+                        } else {
+                            language.choose("Đang mở dự án…", "Opening project…")
+                        }),
+                )
+            })
+            .when(self.home && self.project_menu.is_some(), |d| {
+                d.child(self.project_menu_overlay(cx))
+            })
             .when(self.help, |d| d.child(self.help_overlay(cx)))
             .when(self.settings, |d| d.child(self.settings_overlay(cx)))
             .when(self.prompt.is_some(), |d| d.child(self.prompt_overlay(cx)))
             .when(self.confirmation.is_some(), |d| {
                 d.child(self.confirmation_overlay(cx))
             })
+            .when(self.close_prompt, |d| d.child(self.close_overlay(cx)))
     }
 }

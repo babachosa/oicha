@@ -153,7 +153,8 @@ fn supported_commands_match_vim_reference() {
         ("yiw retains column", "hello world", 8, &["y", "i", "w"]),
         ("yy retains column", "hello\nworld", 2, &["y", "y"]),
         ("dd middle", "abc\ndef\nghi", 4, &["d", "d"]),
-        ("dd last", "abc\ndef", 4, &["d", "d"]),
+        // dd intentionally keeps a final writing row and uses display rows in
+        // the app. Its custom cases are covered in the editor/native tests.
         (
             "cc middle",
             "abc\ndef\nghi",
