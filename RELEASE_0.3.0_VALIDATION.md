@@ -35,4 +35,11 @@ Version 0.3.0 is deliberately a breaking storage release: legacy 0.2.x JSON file
 - Production-key metadata signing passed. Actual signed helper/installer update **0.2.7 → 0.3.0** passed: failed save blocks restart, pending Vietnamese/emoji text is saved by the old app, new binary is installed/restarted, payload hashes and registry version match, English preference and shortcut options survive, and the legacy JSON document remains intact and is rejected by the new storage API. `artifacts/windows-update-qa-results.json`; `artifacts/update-qa-9d90913ea87c4f839de5a156521630c8`.
 - Consolidated record: `artifacts/release-0.3.0-acceptance.json`. PowerShell syntax and `git diff --check` passed. Secret-pattern scan of publishable sources found no private keys or GitHub tokens.
 
-No blocking defect remains in the reviewed/tested Windows workflows. Publication and the live stable-feed probe follow after this artifact acceptance. This review does not claim absence of every possible defect or validation of other operating systems.
+## Production publication
+
+- Published stable [v0.3.0](https://github.com/babachosa/oicha/releases/tag/v0.3.0), release commit `5c4ce723325e68ba3a82bc2edcaa06d2a830ad0a`, on 2026-10-19 at 07:07:39 UTC.
+- All four uploaded assets were checked against local byte counts and GitHub SHA-256 digests before publishing: Setup, checksum, package manifest and signed `oicha-update.json`. Existing releases were preserved.
+- `oicha-release probe 0.2.7 artifacts/release-0.3.0-live-feed`: passed using the anonymous production stable feed, real download, embedded public key and installer checksum. `artifacts/release-0.3.0-live-probe.txt`.
+- Checking from version 0.3.0 reports no newer release, so it is not offered again. `artifacts/release-0.3.0-current-probe.txt`.
+
+No blocking defect remains in the reviewed/tested Windows workflows. This review does not claim absence of every possible defect or validation of other operating systems.
