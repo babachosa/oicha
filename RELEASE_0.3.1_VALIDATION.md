@@ -60,4 +60,23 @@ native workflows, update signature/download integrity and the public feed.
   remains a QA limitation, rather than evidence that every frame deadline is
   guaranteed under desktop load.
 - Consolidated acceptance: `artifacts/release-0.3.1-acceptance.json`.
-  Public-feed publication verification will be appended after uploading.
+
+## Production publication
+
+- Published stable [v0.3.1](https://github.com/babachosa/oicha/releases/tag/v0.3.1)
+  from commit `ef3a1c8e32255c429d3b30e61593cacd3643ee56`, GitHub release
+  `419130100`, at 2026-10-21 03:43:37 UTC. Code and annotated tag were pushed.
+- All four uploaded assets (Setup, SHA-256, manifest and signed metadata)
+  matched local sizes and GitHub SHA-256 digests before publishing.
+  `artifacts/release-0.3.1-upload-verification.json`.
+- Anonymous production `oicha-release probe 0.3.0` downloaded **0.3.1** and
+  verified the Ed25519 signature and actual installer checksum using the
+  patched TLS stack. A probe from **0.3.1** reports no newer release.
+  `artifacts/release-0.3.1-live-probe.txt`, `-current-probe.txt`.
+- GitHub latest-release API confirms a public, stable 0.3.1 with all assets.
+  Actions were still running at publication; the release was uploaded directly
+  with `gh`, and its workflow preserves an already published release's assets.
+
+No blocking defect remains in the exercised release workflows. This record
+does not claim exhaustive Vim compatibility or a fresh installer-driven
+upgrade/uninstall test on the user's live installation.
