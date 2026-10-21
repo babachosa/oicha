@@ -1,5 +1,5 @@
 //! UI-independent, UTF-8/grapheme-safe editing and a deliberately scoped Vim engine.
-use crate::document::{RichText, TextStyle};
+use crate::document::{RichText, StyledRange, TextStyle};
 use std::{ops::Range, time::Duration};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
@@ -48,6 +48,9 @@ struct Snapshot {
     body: RichText,
     cursor: usize,
     anchor: usize,
+    // Some Vim edits finish on their last character but redo returns to the
+    // start of the change. Preserve that location across repeated undo/redo.
+    redo_cursor: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +102,7 @@ pub struct Editor {
     pending_g: bool,
     pending_z: Option<usize>,
     pending_find: Option<(bool, usize)>,
+    pending_replace: Option<usize>,
     last_find: Option<CharacterFind>,
     object: Option<char>,
     visual_anchor: usize,
@@ -133,6 +137,7 @@ impl Editor {
             pending_g: false,
             pending_z: None,
             pending_find: None,
+            pending_replace: None,
             last_find: None,
             object: None,
             visual_anchor: 0,
@@ -150,6 +155,7 @@ impl Editor {
             body: self.body.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
+            redo_cursor: None,
         }
     }
     fn restore(&mut self, s: Snapshot) {
@@ -201,14 +207,22 @@ impl Editor {
     pub fn undo(&mut self) {
         self.finish_group();
         if let Some(s) = self.undo.pop() {
-            self.redo.push(self.snapshot());
+            let mut redo = self.snapshot();
+            redo.redo_cursor = s.redo_cursor;
+            if let Some(cursor) = s.redo_cursor {
+                redo.cursor = cursor;
+                redo.anchor = cursor;
+            }
+            self.redo.push(redo);
             self.restore(s);
         }
     }
     pub fn redo(&mut self) {
         self.finish_group();
         if let Some(s) = self.redo.pop() {
-            self.undo.push(self.snapshot());
+            let mut undo = self.snapshot();
+            undo.redo_cursor = s.redo_cursor;
+            self.undo.push(undo);
             self.restore(s);
         }
     }
@@ -607,6 +621,7 @@ impl Editor {
         self.pending_g = false;
         self.pending_z = None;
         self.pending_find = None;
+        self.pending_replace = None;
         self.operator_count = 1;
         self.object_count = 1;
     }
@@ -625,8 +640,107 @@ impl Editor {
             self.count,
             self.pending_find
                 .map(|(backwards, _)| if backwards { "F" } else { "f" })
+                .map(str::to_owned)
+                .or_else(|| self.pending_replace.map(|count| if count == 1 {
+                    "r".into()
+                } else {
+                    format!("{count}r")
+                }))
                 .unwrap_or_default()
         )
+    }
+
+    pub fn awaiting_replace(&self) -> bool {
+        self.pending_replace.is_some()
+    }
+
+    fn replace_characters(&mut self, count: usize, target: &str) {
+        let visual = matches!(self.mode, Mode::Visual | Mode::VisualLine);
+        // In Visual mode Vim's r<Enter> inserts literal CR characters; existing
+        // paragraph breaks remain intact. Normal r<Enter> inserts one newline.
+        let target = if visual && target == "\n" {
+            "\r"
+        } else {
+            target
+        };
+        let range = if visual {
+            self.visual_range()
+        } else {
+            let start = self.snap(self.cursor);
+            let mut end = start;
+            let line_end = self.line_end(start);
+            for _ in 0..count {
+                if end >= line_end {
+                    return;
+                }
+                end = self.next(end);
+            }
+            start..end
+        };
+        let mut replacement = RichText::default();
+        let mut has_character = false;
+        let mut style_index = 0;
+        for (offset, original) in self.body.text[range.clone()].grapheme_indices(true) {
+            has_character |= original != "\n";
+            let position = range.start + offset;
+            while self
+                .body
+                .runs
+                .get(style_index)
+                .is_some_and(|run| run.range.end <= position)
+            {
+                style_index += 1;
+            }
+            let style = self
+                .body
+                .runs
+                .get(style_index)
+                .map(|run| run.style)
+                .unwrap_or_default();
+            // Visual replacement keeps existing paragraph separators. A counted
+            // normal r<Enter> replaces its entire span with one line break.
+            let value = if original == "\n" { "\n" } else { target };
+            let start = replacement.text.len();
+            replacement.text.push_str(value);
+            let end = replacement.text.len();
+            if let Some(last) = replacement.runs.last_mut().filter(|run| run.style == style) {
+                last.range.end = end;
+            } else {
+                replacement.runs.push(StyledRange {
+                    range: start..end,
+                    style,
+                });
+            }
+            if !visual && target == "\n" {
+                break;
+            }
+        }
+        if range.is_empty() || !has_character {
+            self.mode = Mode::Normal;
+            self.anchor = self.cursor;
+            self.visual_anchor = self.cursor;
+            return;
+        }
+        self.finish_group();
+        let start = range.start;
+        self.replace(range, &replacement.text);
+        let end = start + replacement.text.len();
+        self.body.replace_rich(start..end, &replacement);
+        let redo_cursor = self.snap(start);
+        if let Some(undo) = self.undo.last_mut() {
+            undo.redo_cursor = Some(redo_cursor);
+        }
+        self.mode = Mode::Normal;
+        let cursor = if visual {
+            start
+        } else if target == "\n" {
+            end
+        } else {
+            self.previous(end)
+        };
+        self.move_to(cursor, false);
+        self.clamp_normal();
+        self.visual_anchor = self.cursor;
     }
 
     fn find_character(&mut self, find: &CharacterFind, count: usize) -> Effect {
@@ -900,6 +1014,23 @@ impl Editor {
             return Effect::None;
         }
         if !self.vim || self.mode == Mode::Insert {
+            return Effect::None;
+        }
+        if let Some(count) = self.pending_replace.take() {
+            let target = match key {
+                "space" => " ",
+                "tab" => "\t",
+                "enter" | "\r" => "\n",
+                _ => key,
+            };
+            self.reset_pending();
+            if target.graphemes(true).count() == 1
+                && !target
+                    .chars()
+                    .any(|c| c.is_control() && !matches!(c, '\t' | '\n'))
+            {
+                self.replace_characters(count, target);
+            }
             return Effect::None;
         }
         if let Some((backwards, count)) = self.pending_find.take() {
@@ -1310,6 +1441,7 @@ impl Editor {
             return Effect::None;
         }
         match key {
+            "r" => self.pending_replace = Some(count),
             "i" => self.enter_insert(),
             "a" => {
                 self.cursor = self.next(self.cursor).min(self.line_end(self.cursor));
@@ -1544,6 +1676,158 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replace_character_is_counted_literal_and_grapheme_safe() {
+        for (text, cursor, command, target, expected, at) in [
+            ("abcdef", 1, "3", "x", "axxxef", 3),
+            ("abc\ndef", 1, "2", "i", "aii\ndef", 2),
+            (
+                "niềm 🌿 tin",
+                2,
+                "2",
+                "a\u{0301}",
+                "nia\u{0301}a\u{0301} 🌿 tin",
+                5,
+            ),
+            ("a🌿b", 1, "1", "ế", "aếb", 1),
+            ("a\u{0301}bc", 0, "1", "🌿", "🌿bc", 0),
+            ("abc", 0, "1", "0", "0bc", 0),
+            ("abc", 0, "1", "/", "/bc", 0),
+            ("abc", 0, "1", ":", ":bc", 0),
+            ("abc", 0, "1", "r", "rbc", 0),
+        ] {
+            let mut e = editor(text);
+            e.move_to(cursor, false);
+            keys(&mut e, &[command, "r"]);
+            assert!(e.pending().ends_with('r'));
+            e.key(target);
+            assert_eq!(e.body.text, expected);
+            assert_eq!(e.cursor, at);
+            assert_eq!(e.anchor, at);
+            assert_eq!(e.mode, Mode::Normal);
+            assert!(e.pending().is_empty());
+            e.body.validate().unwrap();
+            e.undo();
+            assert_eq!(e.body.text, text);
+            assert_eq!(e.cursor, cursor);
+            e.redo();
+            assert_eq!(e.body.text, expected);
+        }
+    }
+
+    #[test]
+    fn replace_failure_cancel_and_wrong_mode_do_not_edit_or_arm_an_operator() {
+        for (text, at, command) in [
+            ("ab\ncd", 1, vec!["2", "r", "x"]),
+            ("ab\n\ncd", 3, vec!["r", "x"]),
+            ("", 0, vec!["r", "x"]),
+            ("ab\n", 3, vec!["r", "x"]),
+            ("abc", 1, vec!["r", "escape"]),
+            ("abc", 1, vec!["r", "left"]),
+            ("abc", 1, vec!["r", "ctrl-r"]),
+            ("abc", 1, vec!["d", "r"]),
+        ] {
+            let mut e = editor(text);
+            e.move_to(at, false);
+            keys(&mut e, &command);
+            assert_eq!(e.body.text, text);
+            assert_eq!(e.cursor, at);
+            assert_eq!(e.generation, 0);
+            assert!(e.pending().is_empty());
+            assert!(e.undo.is_empty());
+            e.key("l");
+            assert_eq!(e.body.text, text);
+        }
+        for vim in [true, false] {
+            let mut e = editor("abc");
+            if vim {
+                e.key("i");
+            } else {
+                e.toggle_vim();
+            }
+            keys(&mut e, &["r", "x"]);
+            assert_eq!(e.body.text, "abc");
+            assert!(e.pending().is_empty());
+        }
+    }
+
+    #[test]
+    fn replace_preserves_styles_register_and_separate_undo_transactions() {
+        let mut e = editor("niềm 🌿 tin");
+        e.body.format(2.."niềm".len(), |style| style.bold = true);
+        e.body.format("niềm ".len().."niềm 🌿".len(), |style| {
+            style.italic = true
+        });
+        e.move_to(2, false);
+        let original = e.body.clone();
+        e.register = RichText::plain("clipboard stays");
+        e.linewise_register = true;
+        keys(&mut e, &["4", "r", "x"]);
+        assert_eq!(e.body.text, "nixxxx tin");
+        assert!(e.body.style_at(2).bold && e.body.style_at(3).bold);
+        assert!(!e.body.style_at(4).bold && !e.body.style_at(4).italic);
+        assert!(e.body.style_at(5).italic);
+        assert_eq!(e.register.text, "clipboard stays");
+        assert!(e.linewise_register);
+        e.body.validate().unwrap();
+        e.undo();
+        assert_eq!(e.body, original);
+        e.redo();
+        assert_eq!(e.body.text, "nixxxx tin");
+        e.key("r");
+        e.key("z");
+        e.undo();
+        assert_eq!(e.body.text, "nixxxx tin");
+        e.undo();
+        assert_eq!(e.body, original);
+    }
+
+    #[test]
+    fn visual_replace_keeps_paragraphs_and_reversed_selection() {
+        for (at, command, expected) in [
+            (1, vec!["v", "j", "r", "x"], "axx\nxxf"),
+            (5, vec!["v", "k", "r", "x"], "axx\nxxf"),
+            (1, vec!["V", "j", "r", "x"], "xxx\nxxx"),
+        ] {
+            let mut e = editor("abc\ndef");
+            e.move_to(at, false);
+            keys(&mut e, &command);
+            assert_eq!(e.body.text, expected);
+            assert_eq!(e.mode, Mode::Normal);
+            assert!(e.pending().is_empty());
+            e.body.validate().unwrap();
+            e.undo();
+            assert_eq!(e.body.text, "abc\ndef");
+        }
+    }
+
+    #[test]
+    fn replace_enter_is_one_break_for_a_count_and_does_not_cross_a_paragraph() {
+        let mut e = editor("abcdef\nnext");
+        e.move_to(1, false);
+        keys(&mut e, &["3", "r", "enter"]);
+        assert_eq!(e.body.text, "a\nef\nnext");
+        assert_eq!(e.cursor, 2);
+        e.undo();
+        assert_eq!(e.body.text, "abcdef\nnext");
+        keys(&mut e, &["r", "tab"]);
+        assert_eq!(e.body.text, "a\tcdef\nnext");
+    }
+
+    #[test]
+    fn visual_replace_on_an_empty_row_exits_without_a_phantom_undo() {
+        for (text, at) in [("", 0), ("abc\n", 4), ("abc\n\ndef", 4)] {
+            let mut e = editor(text);
+            e.move_to(at, false);
+            keys(&mut e, &["V", "r", "x"]);
+            assert_eq!(e.mode, Mode::Normal);
+            assert_eq!(e.body.text, text);
+            assert!(e.pending().is_empty());
+            assert_eq!(e.generation, 0);
+            assert!(e.undo.is_empty());
+        }
+    }
+
     #[test]
     fn dd_deletes_only_the_display_row_and_keeps_following_paragraphs() {
         for (cursor, expected, at, register) in [

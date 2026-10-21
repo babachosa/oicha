@@ -189,7 +189,7 @@ pub struct TextEditor {
     blink: bool,
     autoscroll: bool,
     center_cursor: bool,
-    advance_page: bool,
+    pub(crate) advance_page: bool,
     follow_edit: bool,
     last_caret_row: Option<Pixels>,
     viewport_height: Pixels,
@@ -286,6 +286,10 @@ impl TextEditor {
         let blur = cx.on_blur(&focus, window, |this, window, cx| {
             crate::input_context::set_mode(window, false);
             this.engine.finish_group();
+            if this.engine.awaiting_replace() {
+                this.engine.escape();
+                cx.emit(EditorEvent::State);
+            }
             cx.notify();
         });
         let blink_task = cx.spawn_in(window, async move |this, cx| {
@@ -656,7 +660,9 @@ impl TextEditor {
             if matches!(command, "n" | "N") && self.engine.pending().is_empty() {
                 cx.emit(EditorEvent::FindNext(command == "N"));
             } else {
-                let append_row = matches!(command, "o" | "O") && self.engine.mode == Mode::Normal;
+                let append_row = matches!(command, "o" | "O")
+                    && self.engine.mode == Mode::Normal
+                    && self.engine.pending().is_empty();
                 match self.engine.key(command) {
                     Effect::Command => cx.emit(EditorEvent::Command),
                     Effect::Search => cx.emit(EditorEvent::Search),
@@ -1215,6 +1221,9 @@ impl TextEditor {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.engine.awaiting_replace() {
+            self.engine.escape();
+        }
         self.advance_page = false;
         self.follow_edit = false;
         self.center_cursor = false;

@@ -4,7 +4,7 @@
 
 ## Chạy trên Windows
 
-Bộ cài: [Oicha 0.3.0 cho Windows x64](https://github.com/babachosa/oicha/releases/tag/v0.3.0), hoặc `dist/Oicha-0.3.0-Windows-x64-Setup.exe` khi tự build. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
+Bộ cài: [Oicha 0.3.1 cho Windows x64](https://github.com/babachosa/oicha/releases/tag/v0.3.1), hoặc `dist/Oicha-0.3.1-Windows-x64-Setup.exe` khi tự build. Dùng Windows 10 phiên bản 2004 trở lên hoặc Windows 11 x64, GPU hỗ trợ DirectX 11. Cài cho tài khoản hiện tại, không cần quyền admin, Rust, Node hay cài font riêng. Start Menu có shortcut Oicha; có thể chọn thêm shortcut Desktop và mục Open with cho file `.oicha`. Gỡ trong Windows Settings → Apps sẽ giữ lại bản thảo. Đóng app để lưu trước khi nâng cấp/gỡ cài đặt. Bản hiện tại chưa ký số theo lựa chọn của người dùng.
 
 Bản 0.3.0 đổi định dạng kho: file `.oicha` cũ từ 0.2.x được giữ nguyên nhưng không mở hoặc chuyển đổi. Nếu cần dùng nội dung bên ngoài app, hãy xuất TXT/DOCX bằng bản cũ trước khi nâng cấp.
 
@@ -72,6 +72,7 @@ Vim bật mặc định. Nhấn **i** để viết, **Esc** trở lại Normal. 
 | Operator + motion | `d y c`, ví dụ `dw`, `3dw`, `d2w`, `dd`, `yy`, `cc` |
 | Xóa hàng hiển thị | `dd` chỉ xóa hàng đang nhìn thấy; `3dd`, `d3d`, `2d2d` đếm hàng hiển thị. Xóa hàng cuối giữ một hàng trống để `i` viết tiếp ngay. `u` khôi phục nguyên nội dung và định dạng; phần đã xóa vẫn vào register để `p/P` dán theo dòng |
 | Text object | `diw`, `daw`, `ciw`, `yiw` |
+| Thay ký tự | `r{ký tự}` thay ký tự dưới con trỏ rồi giữ Normal; `3ra` thay 3 ký tự bằng `a`. Visual `r{ký tự}` thay vùng chọn, giữ dấu xuống đoạn; `Esc` hủy |
 | Xóa, nối dòng, dán | `x X`, `D C`, `J`, `p P` |
 | Lịch sử | `u`, `Ctrl+R`, `Ctrl+Z`; `Ctrl+Y` redo khi Insert hoặc tắt Vim |
 | Tìm | `/`, `n`, `N`; `Ctrl+F` khi Insert hoặc tắt Vim |
@@ -83,6 +84,8 @@ Vim bật mặc định. Nhấn **i** để viết, **Esc** trở lại Normal. 
 | Xuất DOCX | `Ctrl+Shift+E` |
 
 `f/F` tìm trong dòng logic: có thể đi qua các hàng tự xuống dòng, nhưng dừng ở dấu Enter. Nhấn `Esc` để hủy khi đang chờ ký tự. Nếu không đủ số lần khớp, con trỏ và văn bản giữ nguyên, kể cả với `df/cf/yf`. Ký tự đích được hiểu nguyên văn, bao gồm chữ số, khoảng trắng, `/`, `:` và dấu tiếng Việt. `,` tìm ngược tạm thời; `;` vẫn dùng chiều của lệnh `f/F` ban đầu.
+
+`r` đếm ký tự ghép Unicode, không cắt đôi dấu tiếng Việt hoặc emoji. Thay nhiều ký tự chỉ là một lượt undo, giữ định dạng từng vị trí và không đổi register/clipboard. Nếu không đủ ký tự trong dòng logic thì không thay gì. Normal `r` + Enter thay bằng một dấu xuống đoạn (kể cả `3r` + Enter); `r` + Tab thay bằng ký tự tab. Visual `r` + Enter chèn ký tự CR nguyên văn như Vim. Ctrl+V để nhập ký tự điều khiển và digraph của Vim chưa được hỗ trợ.
 
 Theo yêu cầu soạn tiểu thuyết, `j/k` được ánh xạ như `gj/gk` của Vim để đi từng hàng được renderer xuống dòng. Vim mặc định dùng `j/k` cho dòng logic; đây là ánh xạ có chủ đích, tương đương `nnoremap j gj`, `nnoremap k gk`, `xnoremap j gj`, `xnoremap k gk`. `0` (và Home trong Normal/Visual) dùng đầu hàng hiển thị; `v0`, `d0`, `c0`, `y0` cũng dùng biên hàng này. Chữ số `0` trong count như `10l` vẫn giữ ý nghĩa đếm. Operator `dj/dk`, `yy/cc` và Visual Line vẫn theo dòng logic; `dd` dùng hàng hiển thị và giữ hàng trống ở cuối bản thảo; `dgj/dgk` là thao tác theo hàng hiển thị. `h/l` dừng tại biên dòng, Normal đứng trên ký tự cuối, `$`/`G`/`gg`, `cw`, xóa/dán dòng cuối và số lần lặp đã có kiểm thử đối chiếu Vim thật.
 

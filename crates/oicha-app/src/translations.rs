@@ -155,6 +155,10 @@ pub const CATALOG: &[(&str, &str)] = &[
         "Line operations and commands with counts",
     ),
     (
+        "Thay ký tự · thay 3 ký tự bằng a · Esc để hủy",
+        "Replace character · replace 3 characters with a · Esc to cancel",
+    ),
+    (
         "Xóa hàng hiển thị · giữ hàng trống ở cuối bản thảo",
         "Delete display rows · keep an empty writing row at the end",
     ),

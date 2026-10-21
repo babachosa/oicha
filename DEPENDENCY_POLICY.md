@@ -3,6 +3,14 @@
 The application and editor remain Rust/GPUI. The PowerShell scripts are build
 and QA tools; the desktop runtime does not execute them.
 
+Oicha 0.3.1 updates the locked TLS dependencies to `rustls-webpki 0.103.16`
+and `webpki-roots 1.0.10`, fixing
+[RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html) and
+[RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html),
+published on 2026-10-20. Neither vulnerability is excepted. Release validation
+must check the signed production update feed and actual installer download
+through the patched TLS stack as well as rerunning the dependency scan.
+
 Oicha 0.2.4 upgrades the DOCX writer's `zip` dependency from 4.6.1 to 9.0.4.
 This removes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369 from
 the locked graph. These extraction advisories have not been added to any

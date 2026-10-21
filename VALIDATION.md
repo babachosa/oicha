@@ -1,6 +1,10 @@
-# Validation — 2026-10-19
+# Validation — 2026-10-21
 
-Current release review: [RELEASE_0.3.0_VALIDATION.md](RELEASE_0.3.0_VALIDATION.md) records all unpublished changes since 0.2.7, the review fixes, deliberate format break, release checks and production update evidence.
+Release 0.3.1: [RELEASE_0.3.1_VALIDATION.md](RELEASE_0.3.1_VALIDATION.md) records the Vim replacement release, TLS security updates, final package and production feed checks.
+
+Vim `r` implementation checks (2026-10-21): [VIM_REPLACE_VALIDATION_2026-10-21.md](VIM_REPLACE_VALIDATION_2026-10-21.md) records counted replacement, Visual/Unicode/style/history behavior, Vim differential checks and native dispatch evidence.
+
+Previous release review: [RELEASE_0.3.0_VALIDATION.md](RELEASE_0.3.0_VALIDATION.md) records all unpublished changes since 0.2.7, the review fixes, deliberate format break, release checks and production update evidence.
 
 Localized notification system: [NOTIFICATIONS_VALIDATION_2026-10-19.md](NOTIFICATIONS_VALIDATION_2026-10-19.md) records short Vietnamese/English copy, separate technical details, shared severity styling and small-window modal checks.
 

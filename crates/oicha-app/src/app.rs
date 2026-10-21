@@ -603,6 +603,30 @@ impl Oicha {
                 let dispatch = |key: &str, window: &mut Window, cx: &mut App| {
                     window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                 };
+                // Replacement targets must not become search/Ex/open-row commands.
+                for (target, value) in [("/", "/"), (":", ":"), ("n", "n"), ("N", "N"), ("o", "o"), ("O", "O"), ("0", "0"), ("r", "r"), ("f", "f"), ("ề", "ề"), ("space", " "), ("tab", "\t"), ("enter", "\n")] {
+                    cx.update(|_, cx| editor.update(cx, |e, cx| {
+                        let generation = e.engine.generation + 1;
+                        e.engine = oicha_core::editor::Editor::new(RichText::plain("abcdef\nniềm tin"));
+                        e.engine.generation = generation; e.engine.move_to(1, false);
+                        e.advance_page = false; e.reveal_cursor(cx); cx.emit(EditorEvent::Changed);
+                    }))?;
+                    cx.update(|window, cx| { dispatch("3", window, cx); dispatch("r", window, cx); })?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.pending() == "3r")?, "Counted r did not wait for a target");
+                    cx.update(|window, cx| dispatch(target, window, cx))?;
+                    let expected = format!("a{}ef\nniềm tin", if value == "\n" { value.into() } else { value.repeat(3) });
+                    anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.body.text == expected && e.engine.mode == oicha_core::editor::Mode::Normal && e.engine.pending().is_empty() && !e.advance_page })?, "Native r target {target:?} was intercepted or requested open-row scrolling");
+                    anyhow::ensure!(this.update(cx, |this, _| this.prompt.is_none())?, "Native r target opened a prompt");
+                    cx.update(|window, cx| dispatch("u", window, cx))?;
+                    anyhow::ensure!(cx.update(|_, cx| editor.read(cx).engine.body.text == "abcdef\nniềm tin")?, "Native r undo changed more than the replacement");
+                    cx.update(|window, cx| dispatch("ctrl-r", window, cx))?;
+                    anyhow::ensure!(cx.update(|_, cx| { let e = editor.read(cx); e.engine.body.text == expected && e.engine.cursor == if value == "\n" { 0 } else { 1 } })?, "Native r redo did not restore the change at its start");
+                }
+                cx.update(|window, cx| { dispatch("r", window, cx); dispatch("escape", window, cx); })?;
+                anyhow::ensure!(cx.update(|_, cx| !editor.read(cx).engine.awaiting_replace())?, "Escape did not cancel native r");
+                cx.update(|window, cx| { dispatch("r", window, cx); dispatch("ctrl-c", window, cx); })?;
+                anyhow::ensure!(cx.update(|_, cx| !editor.read(cx).engine.awaiting_replace())?, "GUI shortcut left r armed");
+                atomic_write(&report.with_extension("replace.json"), &serde_json::to_vec_pretty(&serde_json::json!({"result":"PASS", "targets":13, "counted":true, "undoRedo":true, "escape":true, "shortcutCancellation":true, "noCommandOrScrollLeak":true}))?)?;
                 // dd follows real shaped rows, including when two d events
                 // arrive before the next frame. Undo must restore one edit.
                 let dd_text = format!("{}\nĐoạn sau giữ nguyên.", "Niềm tin 🌿 và ánh sáng buổi chiều. ".repeat(45));
@@ -2631,6 +2655,12 @@ impl Oicha {
     fn keyboard(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let ctrl = k.modifiers.control || k.modifiers.platform;
+        if ctrl && self.editors[self.active].read(cx).engine.awaiting_replace() {
+            self.editors[self.active].update(cx, |editor, cx| {
+                editor.engine.escape();
+                cx.notify();
+            });
+        }
         if k.modifiers.alt && k.key == "f4" {
             self.request_close(window, cx);
             window.prevent_default();
@@ -4468,6 +4498,10 @@ impl Oicha {
             (
                 "v / V · d / y / c",
                 language.text("Visual / Visual Line · xóa / sao chép / thay"),
+            ),
+            (
+                language.choose("r{ký tự} · 3ra", "r{char} · 3ra"),
+                language.text("Thay ký tự · thay 3 ký tự bằng a · Esc để hủy"),
             ),
             (
                 "dd · 3dd",

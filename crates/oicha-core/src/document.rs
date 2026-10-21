@@ -123,6 +123,41 @@ impl RichText {
         self.runs = runs;
     }
 
+    /// Replace a span while retaining the replacement's individual styles.
+    pub fn replace_rich(&mut self, range: Range<usize>, value: &Self) {
+        assert!(range.start <= range.end && range.end <= self.text.len());
+        assert!(self.text.is_char_boundary(range.start) && self.text.is_char_boundary(range.end));
+        let mut runs = Vec::new();
+        for run in &self.runs {
+            Self::push(
+                &mut runs,
+                run.range.start.min(range.start)..run.range.end.min(range.start),
+                run.style,
+            );
+        }
+        for run in &value.runs {
+            Self::push(
+                &mut runs,
+                range.start + run.range.start..range.start + run.range.end,
+                run.style,
+            );
+        }
+        for run in &self.runs {
+            let start = run.range.start.max(range.end);
+            let end = run.range.end.max(range.end);
+            Self::push(
+                &mut runs,
+                start - range.end + range.start + value.text.len()
+                    ..end - range.end + range.start + value.text.len(),
+                run.style,
+            );
+        }
+        if self.text[range.clone()] != value.text {
+            self.text.replace_range(range, &value.text);
+        }
+        self.runs = runs;
+    }
+
     pub fn slice(&self, range: Range<usize>) -> Self {
         let mut result = Self {
             text: self.text[range.clone()].into(),
